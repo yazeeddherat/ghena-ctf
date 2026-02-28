@@ -1,0 +1,155 @@
+import sys
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout,
+    QLabel, QPushButton, QTextEdit, QGroupBox
+)
+from PyQt6.QtCore import Qt
+
+# -----------------------------
+# LAB ENGINE (تعليمي)
+# -----------------------------
+class LabEngine:
+    def __init__(self):
+        self.stage = 0
+        self.stages = [
+            {
+                "title": "Stage 1: Understanding the Target",
+                "lesson": (
+                    "🎯 الهدف:\n"
+                    "نفهم شو الموجود قدامنا.\n\n"
+                    "📘 الشرح:\n"
+                    "أول خطوة بأي CTF اسمها Recon.\n"
+                    "يعني نفهم الهدف قبل أي هجوم.\n\n"
+                    "🧠 التفكير الصح:\n"
+                    "إذا في Web → نستكشفه يدويًا."
+                ),
+                "result": (
+                    "🧪 نتيجة المحاكاة:\n"
+                    "Website is running.\n"
+                    "Homepage says:\n"
+                    "\"Welcome to our company website\""
+                )
+            },
+            {
+                "title": "Stage 2: robots.txt",
+                "lesson": (
+                    "🎯 الهدف:\n"
+                    "نبحث عن أشياء مخفية.\n\n"
+                    "📘 الشرح:\n"
+                    "robots.txt ملف لمحركات البحث.\n"
+                    "في CTF غالبًا يحتوي مسارات مخفية.\n\n"
+                    "🧠 القاعدة:\n"
+                    "robots.txt ≠ أمان"
+                ),
+                "result": (
+                    "🧪 نتيجة قراءة robots.txt:\n"
+                    "Disallow: /hidden/"
+                )
+            },
+            {
+                "title": "Stage 3: Hidden Directory",
+                "lesson": (
+                    "🎯 الهدف:\n"
+                    "استكشاف المسار المخفي.\n\n"
+                    "📘 ليش هذه خطوة صح؟\n"
+                    "لأنه مسار معروف، بدون تخمين.\n"
+                    "CTF السهل يحب البساطة."
+                ),
+                "result": (
+                    "🧪 محتويات /hidden/:\n"
+                    "- index.html\n"
+                    "- flag.txt"
+                )
+            },
+            {
+                "title": "Stage 4: Flag Found",
+                "lesson": (
+                    "🎯 الهدف:\n"
+                    "قراءة ملف flag.txt\n\n"
+                    "📘 الشرح:\n"
+                    "كثير Flags تكون ملفات نصية مباشرة.\n"
+                    "لا تعقّد الأمور."
+                ),
+                "result": (
+                    "🚩 FLAG FOUND:\n"
+                    "CTF{robots_are_not_security}"
+                )
+            }
+        ]
+
+    def next_stage(self):
+        if self.stage < len(self.stages):
+            data = self.stages[self.stage]
+            self.stage += 1
+            return data
+        return None
+
+
+# -----------------------------
+# GUI
+# -----------------------------
+class GhenaCTFAcademy(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("GHENA CTF ACADEMY")
+        self.setMinimumSize(900, 600)
+        self.engine = LabEngine()
+        self.init_ui()
+
+    def init_ui(self):
+        main = QWidget()
+        layout = QVBoxLayout()
+
+        title = QLabel("🎓 GHENA CTF ACADEMY\nBeginner Training Lab")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet("font-size: 22px; font-weight: bold;")
+
+        self.stage_box = QGroupBox("Stage Explanation")
+        stage_layout = QVBoxLayout()
+        self.lesson_area = QTextEdit()
+        self.lesson_area.setReadOnly(True)
+        stage_layout.addWidget(self.lesson_area)
+        self.stage_box.setLayout(stage_layout)
+
+        self.result_box = QGroupBox("Lab Result")
+        result_layout = QVBoxLayout()
+        self.result_area = QTextEdit()
+        self.result_area.setReadOnly(True)
+        result_layout.addWidget(self.result_area)
+        self.result_box.setLayout(result_layout)
+
+        self.btn_next = QPushButton("▶ Next Step")
+        self.btn_next.setStyleSheet("font-size: 16px; padding: 10px;")
+        self.btn_next.clicked.connect(self.next_step)
+
+        layout.addWidget(title)
+        layout.addWidget(self.stage_box)
+        layout.addWidget(self.result_box)
+        layout.addWidget(self.btn_next)
+
+        main.setLayout(layout)
+        self.setCentralWidget(main)
+
+        self.next_step()
+
+    def next_step(self):
+        data = self.engine.next_stage()
+        if not data:
+            self.lesson_area.setText("🎉 LAB COMPLETED!\nYou are ready for the next lab.")
+            self.result_area.clear()
+            self.btn_next.setEnabled(False)
+            return
+
+        self.stage_box.setTitle(data["title"])
+        self.lesson_area.setText(data["lesson"])
+        self.result_area.setText(data["result"])
+
+
+# -----------------------------
+# RUN
+# -----------------------------
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = GhenaCTFAcademy()
+    win.show()
+    sys.exit(app.exec())
