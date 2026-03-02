@@ -1,155 +1,508 @@
+#!/usr/bin/env python3
+# ==========================================
+# AI-Powered CTF Coach - الإصدار المتكامل
+# يجمع بين التوجيه التفاعلي والتحليل الذكي
+# ==========================================
+
+import os
 import sys
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout,
-    QLabel, QPushButton, QTextEdit, QGroupBox
-)
-from PyQt6.QtCore import Qt
+import json
+import datetime
+import subprocess
+import re
+import readline  # لتحسين إدخال الأوامر
+from typing import Dict, List, Optional
+import google.generativeai as genai
 
-# -----------------------------
-# LAB ENGINE (تعليمي)
-# -----------------------------
-class LabEngine:
-    def __init__(self):
-        self.stage = 0
-        self.stages = [
-            {
-                "title": "Stage 1: Understanding the Target",
-                "lesson": (
-                    "🎯 الهدف:\n"
-                    "نفهم شو الموجود قدامنا.\n\n"
-                    "📘 الشرح:\n"
-                    "أول خطوة بأي CTF اسمها Recon.\n"
-                    "يعني نفهم الهدف قبل أي هجوم.\n\n"
-                    "🧠 التفكير الصح:\n"
-                    "إذا في Web → نستكشفه يدويًا."
-                ),
-                "result": (
-                    "🧪 نتيجة المحاكاة:\n"
-                    "Website is running.\n"
-                    "Homepage says:\n"
-                    "\"Welcome to our company website\""
-                )
-            },
-            {
-                "title": "Stage 2: robots.txt",
-                "lesson": (
-                    "🎯 الهدف:\n"
-                    "نبحث عن أشياء مخفية.\n\n"
-                    "📘 الشرح:\n"
-                    "robots.txt ملف لمحركات البحث.\n"
-                    "في CTF غالبًا يحتوي مسارات مخفية.\n\n"
-                    "🧠 القاعدة:\n"
-                    "robots.txt ≠ أمان"
-                ),
-                "result": (
-                    "🧪 نتيجة قراءة robots.txt:\n"
-                    "Disallow: /hidden/"
-                )
-            },
-            {
-                "title": "Stage 3: Hidden Directory",
-                "lesson": (
-                    "🎯 الهدف:\n"
-                    "استكشاف المسار المخفي.\n\n"
-                    "📘 ليش هذه خطوة صح؟\n"
-                    "لأنه مسار معروف، بدون تخمين.\n"
-                    "CTF السهل يحب البساطة."
-                ),
-                "result": (
-                    "🧪 محتويات /hidden/:\n"
-                    "- index.html\n"
-                    "- flag.txt"
-                )
-            },
-            {
-                "title": "Stage 4: Flag Found",
-                "lesson": (
-                    "🎯 الهدف:\n"
-                    "قراءة ملف flag.txt\n\n"
-                    "📘 الشرح:\n"
-                    "كثير Flags تكون ملفات نصية مباشرة.\n"
-                    "لا تعقّد الأمور."
-                ),
-                "result": (
-                    "🚩 FLAG FOUND:\n"
-                    "CTF{robots_are_not_security}"
-                )
-            }
+# ================= الإعدادات =================
+SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+]
+GENERATION_CONFIG = {
+    "temperature": 0.1,
+    "top_p": 0.9,
+    "top_k": 40,
+    "max_output_tokens": 8192,
+}
+
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    BOLD = '\033[1m'
+    ENDC = '\033[0m'
+
+# ================= إدارة الجلسات =================
+class Session:
+    def __init__(self, target: str, platform: str, api_key: str = None):
+        self.target = target
+        self.platform = platform
+        self.api_key = api_key
+        self.steps = []          # سجل الخطوات
+        self.findings = {}        # النتائج الرئيسية (مثل المنافذ، الخدمات)
+        self.shell_obtained = False
+        self.ai_enabled = api_key is not None
+        self.ai_model = None
+        if self.ai_enabled:
+            self._init_ai()
+    
+    def _init_ai(self):
+        try:
+            genai.configure(api_key=self.api_key)
+            self.ai_model = genai.GenerativeModel(
+                model_name="gemini-1.5-pro",
+                generation_config=GENERATION_CONFIG,
+                safety_settings=SAFETY_SETTINGS
+            )
+            self.ai_chat = self.ai_model.start_chat(history=[])
+        except Exception as e:
+            print(f"{Colors.FAIL}⚠️ فشل تشغيل الذكاء الاصطناعي: {e}{Colors.ENDC}")
+            self.ai_enabled = False
+    
+    def add_step(self, step_name: str, data: any):
+        self.steps.append({
+            "time": datetime.datetime.now().isoformat(),
+            "step": step_name,
+            "data": data
+        })
+    
+    def save(self, filename: str = None):
+        if not filename:
+            filename = f"session_{self.target.replace('.', '_')}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(filename, 'w') as f:
+            json.dump({
+                "target": self.target,
+                "platform": self.platform,
+                "steps": self.steps,
+                "findings": self.findings,
+                "shell_obtained": self.shell_obtained
+            }, f, indent=2)
+        print(f"{Colors.GREEN}💾 تم حفظ الجلسة في {filename}{Colors.ENDC}")
+        return filename
+    
+    @staticmethod
+    def load(filename: str):
+        with open(filename, 'r') as f:
+            data = json.load(f)
+        session = Session(data['target'], data['platform'])
+        session.steps = data['steps']
+        session.findings = data.get('findings', {})
+        session.shell_obtained = data.get('shell_obtained', False)
+        return session
+
+# ================= أدوات مساعدة =================
+def run_command(cmd: str) -> str:
+    """تنفيذ أمر وعودة الناتج (مع معالجة الأخطاء)"""
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+        return result.stdout + result.stderr
+    except Exception as e:
+        return f"خطأ في تنفيذ الأمر: {e}"
+
+def extract_services_from_nmap(nmap_output: str) -> List[str]:
+    """استخراج أسماء الخدمات من مخرجات nmap (تقريبي)"""
+    services = set()
+    # البحث عن سطور مثل: 80/tcp open  http
+    for line in nmap_output.splitlines():
+        match = re.search(r'\d+/(tcp|udp)\s+open\s+(\S+)', line)
+        if match:
+            services.add(match.group(2).lower())
+    return list(services)
+
+def search_exploit(service_version: str) -> str:
+    """البحث عن استغلال باستخدام searchsploit (إذا كان مثبتاً)"""
+    try:
+        result = subprocess.run(f"searchsploit {service_version}", shell=True, capture_output=True, text=True)
+        return result.stdout
+    except:
+        return "لم يتم العثور على searchsploit أو حدث خطأ."
+
+def ask_yes_no(question: str) -> bool:
+    answer = input(f"{Colors.CYAN}❓ {question} (y/n): {Colors.ENDC}").strip().lower()
+    return answer.startswith('y')
+
+def choose_from_list(options: List[str], prompt: str) -> str:
+    print(f"{Colors.BLUE}{prompt}{Colors.ENDC}")
+    for i, opt in enumerate(options):
+        print(f"  {i+1}. {opt}")
+    while True:
+        choice = input(f"{Colors.CYAN}اختر رقم (أو 0 للتراجع): {Colors.ENDC}").strip()
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(options):
+                return options[idx]
+        print(f"{Colors.FAIL}إدخال غير صالح.{Colors.ENDC}")
+
+# ================= خطوات المنهجية =================
+class Methodology:
+    def __init__(self, session: Session):
+        self.session = session
+    
+    def step_recon(self):
+        """المرحلة 1: الاستطلاع - Nmap"""
+        print(f"\n{Colors.HEADER}{Colors.BOLD}🔍 المرحلة 1: الاستطلاع (Nmap){Colors.ENDC}")
+        
+        # خيار تنفيذ nmap تلقائياً أو إدخال النتائج يدوياً
+        if ask_yes_no("هل تريد تشغيل Nmap تلقائياً؟ (يحتاج صلاحيات)"):
+            cmd = f"nmap -sC -sV {self.session.target}"
+            print(f"{Colors.GREEN}تنفيذ: {cmd}{Colors.ENDC}")
+            output = run_command(cmd)
+            print(output)
+        else:
+            print(f"{Colors.BLUE}الرجاء لصق مخرجات Nmap (ثم اضغط Enter مرتين للانتهاء):{Colors.ENDC}")
+            lines = []
+            while True:
+                line = sys.stdin.readline().rstrip()
+                if line == '':
+                    break
+                lines.append(line)
+            output = "\n".join(lines)
+        
+        # تحليل النتائج
+        services = extract_services_from_nmap(output)
+        self.session.findings['services'] = services
+        self.session.findings['nmap_raw'] = output
+        
+        print(f"{Colors.GREEN}✅ الخدمات المكتشفة: {', '.join(services) if services else 'لا شيء'}{Colors.ENDC}")
+        
+        # استشارة الذكاء الاصطناعي إذا كان مفعلاً
+        if self.session.ai_enabled:
+            advice = self.get_ai_advice("تحليل nmap", output)
+            print(f"\n{Colors.WARNING}🧠 توصيات الذكاء الاصطناعي:{Colors.ENDC}\n{advice}")
+        
+        self.session.add_step("nmap", output)
+        
+        # إذا كانت هناك خدمات ويب، انتقل مباشرة إلى خطوة ويب
+        if 'http' in services or 'https' in services:
+            self.step_web()
+        else:
+            self.step_other_services()
+    
+    def get_ai_advice(self, context: str, data: str) -> str:
+        """إرسال البيانات إلى الذكاء الاصطناعي للحصول على نصائح استراتيجية"""
+        if not self.session.ai_enabled:
+            return "الذكاء الاصطناعي غير مفعّل."
+        
+        prompt = f"""
+[الدور: قائد فريق الاختراق الأحمر]
+[الهدف: {self.session.target}]
+[السياق: {context}]
+
+البيانات المدخلة:
+{data}
+
+المطلوب:
+1. تحليل فني دقيق للنتائج.
+2. تحديد نقاط الضعف المحتملة (CVEs، تكوينات خاطئة).
+3. اقتراح الخطوات التالية بأوامر محددة.
+4. تنبيهات أمنية إن لزم الأمر.
+
+الرجاء الرد بتنسيق منظم مع عناوين واضحة.
+"""
+        try:
+            response = self.session.ai_chat.send_message(prompt)
+            return response.text
+        except Exception as e:
+            return f"حدث خطأ في الاتصال بالذكاء الاصطناعي: {e}"
+    
+    def step_web(self):
+        """المرحلة 2: تحليل خدمات الويب"""
+        print(f"\n{Colors.HEADER}{Colors.BOLD}🌐 المرحلة 2: تحليل الويب{Colors.ENDC}")
+        
+        # فتح المتصفح (اختياري)
+        if ask_yes_no("هل تريد فتح المتصفح على الهدف؟"):
+            os.system(f"xdg-open http://{self.session.target} 2>/dev/null || open http://{self.session.target}")
+        
+        # جمع الملاحظات
+        print(f"{Colors.BLUE}📝 صف ما رأيت في الموقع (أو اكتب 'none'):{Colors.ENDC}")
+        observations = input("> ").strip()
+        
+        # خطوة تعداد الدلائل
+        if ask_yes_no("هل تريد تشغيل Gobuster لاكتشاف الدلائل؟"):
+            wordlist = input("👣 مسار قائمة الكلمات (افتراضي: /usr/share/wordlists/dirb/common.txt): ").strip()
+            if not wordlist:
+                wordlist = "/usr/share/wordlists/dirb/common.txt"
+            cmd = f"gobuster dir -u http://{self.session.target} -w {wordlist}"
+            print(f"{Colors.GREEN}تنفيذ: {cmd}{Colors.ENDC}")
+            output = run_command(cmd)
+            print(output)
+            
+            # استخراج الدلائل
+            dirs = re.findall(r'/(\w+)/?\s+\(Status: 200\)', output)
+            if dirs:
+                print(f"{Colors.GREEN}✅ الدلائل المكتشفة: {', '.join(dirs)}{Colors.ENDC}")
+                self.session.findings['web_dirs'] = dirs
+            else:
+                print(f"{Colors.WARNING}⚠️ لم يتم العثور على دلائل.{Colors.ENDC}")
+        else:
+            output = None
+        
+        # تحليل الذكاء الاصطناعي
+        if self.session.ai_enabled:
+            data_to_send = f"ملاحظات: {observations}\n"
+            if output:
+                data_to_send += f"مخرجات Gobuster:\n{output}"
+            advice = self.get_ai_advice("تحليل الويب", data_to_send)
+            print(f"\n{Colors.WARNING}🧠 توصيات الذكاء الاصطناعي:{Colors.ENDC}\n{advice}")
+        
+        self.session.add_step("web_analysis", {"observations": observations, "gobuster": output})
+        
+        # التوجيه بناءً على وجود رفع ملفات أو تسجيل دخول
+        if 'upload' in observations or (output and 'upload' in output):
+            self.step_upload()
+        elif 'login' in observations or (self.session.findings.get('web_dirs') and 'admin' in self.session.findings['web_dirs']):
+            self.step_login()
+        else:
+            self.step_web_general()
+    
+    def step_upload(self):
+        print(f"\n{Colors.HEADER}{Colors.BOLD}📤 مرحلة رفع الملفات{Colors.ENDC}")
+        if ask_yes_no("هل جربت رفع ملف بسيط (مثل test.txt)؟"):
+            result = input("ماذا حدث؟ (مثال: تم الرفع / خطأ في الامتداد): ").strip()
+            if 'رفع' in result:
+                if ask_yes_no("هل حاولت رفع شيل (مثل shell.php)؟"):
+                    shell_result = input("نتيجة رفع الشيل: ").strip()
+                    if 'نجح' in shell_result or 'تم' in shell_result:
+                        self.session.shell_obtained = True
+                        print(f"{Colors.GREEN}✅ يبدو أنك حصلت على شيل! توجه إلى مرحلة رفع الصلاحيات.{Colors.ENDC}")
+                        self.step_privesc()
+                        return
+            else:
+                # تقديم نصائح لتجاوز الفلاتر
+                tips = """
+🔧 نصائح لتجاوز رفع الملفات:
+- جرب امتدادات مزدوجة: shell.php.jpg
+- غيّر Content-Type إلى image/jpeg
+- استخدم تقنيات Null Byte (قديمة)
+- جرب رمل .htaccess لتمكين تنفيذ php
+"""
+                print(tips)
+                if self.session.ai_enabled:
+                    advice = self.get_ai_advice("رفع الملفات", result)
+                    print(advice)
+        self.step_web_general()  # العودة للخطوات العامة
+    
+    def step_login(self):
+        print(f"\n{Colors.HEADER}{Colors.BOLD}🔐 مرحلة تحليل تسجيل الدخول{Colors.ENDC}")
+        # اقتراح هجمات
+        print("💡 أفكار للاختبار:")
+        print("  - SQL Injection: admin' OR '1'='1")
+        print("  - اسم مستخدم شائع: admin/admin, root/root")
+        print("  - تجاوز المصادقة عبر تغيير معاملات (id=..)")
+        if ask_yes_no("هل تريد تجربة SQL Injection بسيطة؟"):
+            # يمكن إدخال نتيجة
+            pass
+        if self.session.ai_enabled:
+            advice = self.get_ai_advice("صفحة تسجيل دخول", "قدم نصائح مخصصة لهذه الحالة")
+            print(advice)
+        # بعد تجربة، نسأل إذا تم الاختراق
+        if ask_yes_no("هل تمكنت من الدخول؟"):
+            print("🎉 ممتاز! ابحث عن وظائف حساسة بعد الدخول.")
+            # ننتقل لمرحلة ما بعد الدخول
+            self.step_post_auth()
+        else:
+            print("🔍 استمر في التحليل، راجع الكود المصدري وملفات JavaScript.")
+    
+    def step_post_auth(self):
+        print(f"\n{Colors.HEADER}{Colors.BOLD}🔑 بعد المصادقة{Colors.ENDC}")
+        # توجيه لاستكشاف الميزات
+        print("👀 ابحث عن:")
+        print("  - رفع ملفات")
+        print("  - تنفيذ أوامر")
+        print("  - ثغرات في لوحات التحكم")
+        if ask_yes_no("هل وجدت طريقة لتنفيذ أوامر أو رفع شيل؟"):
+            self.session.shell_obtained = True
+            self.step_privesc()
+    
+    def step_web_general(self):
+        print(f"\n{Colors.HEADER}{Colors.BOLD}🔍 استكشاف ويب عام{Colors.ENDC}")
+        print("💡 ركز على:")
+        print("  - معاملات URL (مثل page=، id=)")
+        print("  - ملفات JavaScript")
+        print("  - وجود LFI أو RFI")
+        print("  - ملفات robots.txt، sitemap.xml")
+        if ask_yes_no("هل تريد اختبار LFI بإدخال ../../etc/passwd؟"):
+            # يمكن تنفيذ curl
+            pass
+        if self.session.ai_enabled:
+            advice = self.get_ai_advice("استكشاف ويب", "بناءً على ما تم جمعه، اقترح خطوات محددة.")
+            print(advice)
+    
+    def step_other_services(self):
+        """معالجة الخدمات غير الويب (FTP، SSH، SMB، إلخ)"""
+        print(f"\n{Colors.HEADER}{Colors.BOLD}🛠️ تحليل الخدمات الأخرى{Colors.ENDC}")
+        services = self.session.findings.get('services', [])
+        
+        if 'ftp' in services:
+            print("📁 FTP مفتوح:")
+            if ask_yes_no("هل تريد محاولة الدخول كمجهول (anonymous)؟"):
+                # تنفيذ ftp
+                pass
+        if 'ssh' in services:
+            print("🔑 SSH مفتوح:")
+            print("  - جرب كلمات مرور ضعيفة")
+            print("  - ابحث عن إصدار قديم به ثغرات")
+        if 'smb' in services or 'netbios-ssn' in services:
+            print("📂 SMB متاح:")
+            print("  - استخدم enum4linux أو smbclient")
+        
+        # بحث searchsploit
+        if ask_yes_no("هل تريد البحث عن استغلالات للخدمات المكتشفة؟"):
+            for svc in services:
+                print(f"\n🔎 بحث عن {svc}:")
+                result = search_exploit(svc)
+                print(result)
+        
+        if self.session.ai_enabled:
+            advice = self.get_ai_advice("خدمات متنوعة", f"الخدمات: {services}")
+            print(advice)
+    
+    def step_privesc(self):
+        """مرحلة رفع الصلاحيات"""
+        print(f"\n{Colors.HEADER}{Colors.BOLD}⬆️ مرحلة رفع الصلاحيات{Colors.ENDC}")
+        
+        # إذا لم نحصل على شيل بعد، نسأل
+        if not self.session.shell_obtained:
+            if not ask_yes_no("هل لديك شيل على الجهاز؟"):
+                print("⚠️ عد لمرحلة الاستغلال أولاً.")
+                return
+        
+        # جمع معلومات عن النظام
+        print("📋 أوامر مفيدة لجمع المعلومات:")
+        commands = [
+            "whoami",
+            "id",
+            "uname -a",
+            "sudo -l",
+            "find / -perm -4000 2>/dev/null",
+            "cat /etc/passwd",
+            "ps aux",
+            "netstat -tulpn",
+            "crontab -l",
+            "ls -la /home/",
+            "cat ~/.bash_history"
         ]
+        for cmd in commands:
+            print(f"  - {cmd}")
+        
+        # تشغيل بعضها تلقائياً؟
+        if ask_yes_no("هل تريد تنفيذ بعض هذه الأوامر على الجهاز الهدف؟ (إذا كان لديك وصول)"):
+            # يمكن تنفيذها عبر ssh أو netcat، لكن هنا سنفترض أن المستخدم سينسخ النتائج
+            pass
+        
+        # إدخال النتائج
+        print(f"{Colors.BLUE}الرجاء لصق نتائج الأوامر التي نفذتها (ثم Enter مرتين):{Colors.ENDC}")
+        lines = []
+        while True:
+            line = sys.stdin.readline().rstrip()
+            if line == '':
+                break
+            lines.append(line)
+        output = "\n".join(lines)
+        
+        # تحليل النتائج
+        if self.session.ai_enabled:
+            advice = self.get_ai_advice("رفع الصلاحيات", output)
+            print(f"\n{Colors.WARNING}🧠 توصيات الذكاء الاصطناعي:{Colors.ENDC}\n{advice}")
+        
+        # البحث عن suid أو sudo
+        if 'sudo' in output:
+            print("👀 تحقق من برامج sudo: GTFOBins")
+        if '4000' in output:
+            print("👀 تحقق من SUID binaries في GTFOBins")
+        
+        self.session.add_step("privesc_enum", output)
+    
+    def run(self):
+        """تشغيل المنهجية خطوة بخطوة"""
+        self.step_recon()
+        # بعد الانتهاء من الاستطلاع، قد نكون انتقلنا تلقائياً إلى خطوات أخرى
+        # لكن إذا لم يحصل المستخدم على شيل بعد، نسأل إذا أراد متابعة استكشاف خدمات أخرى
+        while not self.session.shell_obtained:
+            print(f"\n{Colors.BOLD}🧭 القائمة الرئيسية:{Colors.ENDC}")
+            print("  1. العودة لتحليل الويب")
+            print("  2. تحليل خدمات أخرى (FTP, SSH, ...)")
+            print("  3. محاولة استغلال مباشر (searchsploit)")
+            print("  4. إنهاء الجلسة وحفظها")
+            choice = input(f"{Colors.CYAN}اختر: {Colors.ENDC}").strip()
+            if choice == '1':
+                self.step_web()
+            elif choice == '2':
+                self.step_other_services()
+            elif choice == '3':
+                self.step_exploit_search()
+            elif choice == '4':
+                break
+            else:
+                print("اختيار غير صالح.")
+        
+        # بعد الحصول على شيل، ننتقل لرفع الصلاحيات
+        if self.session.shell_obtained:
+            self.step_privesc()
+        
+        print(f"\n{Colors.GREEN}{Colors.BOLD}✅ انتهت الجلسة. شكراً لاستخدامك CTF Coach!{Colors.ENDC}")
+    
+    def step_exploit_search(self):
+        """البحث عن استغلالات باستخدام searchsploit"""
+        query = input("🔎 أدخل اسم الخدمة أو الإصدار للبحث: ").strip()
+        if query:
+            result = search_exploit(query)
+            print(result)
+        else:
+            print("لم يتم إدخال أي شيء.")
 
-    def next_stage(self):
-        if self.stage < len(self.stages):
-            data = self.stages[self.stage]
-            self.stage += 1
-            return data
-        return None
+# ================= الواجهة الرئيسية =================
+def main():
+    os.system('clear' if os.name == 'posix' else 'cls')
+    print(f"{Colors.HEADER}{Colors.BOLD}")
+    print("╔════════════════════════════════════════════════════════════╗")
+    print("║     🧠 AI-Powered CTF Coach - الإصدار المتكامل v2.0       ║")
+    print("║     مشروع تخرج - دليل تفاعلي مع تحليل ذكي                 ║")
+    print("╚════════════════════════════════════════════════════════════╝")
+    print(Colors.ENDC)
+    
+    # إعدادات API
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        api_key = input("🔑 أدخل مفتاح Gemini API (أو اتركه فارغاً لتعطيل الذكاء الاصطناعي): ").strip()
+    
+    # قائمة الخيارات
+    print("\n1. بدء جلسة جديدة")
+    print("2. استئناف جلسة محفوظة")
+    print("3. خروج")
+    choice = input(f"{Colors.CYAN}اختر: {Colors.ENDC}").strip()
+    
+    if choice == '1':
+        target = input("📍 IP الهدف أو URL: ").strip()
+        platform = input("🌐 المنصة (HTB/THM/غيرها): ").strip()
+        session = Session(target, platform, api_key if api_key else None)
+        meth = Methodology(session)
+        meth.run()
+        # حفظ الجلسة بعد الانتهاء
+        if ask_yes_no("هل تريد حفظ الجلسة؟"):
+            session.save()
+    elif choice == '2':
+        filename = input("📁 اسم ملف الجلسة: ").strip()
+        try:
+            session = Session.load(filename)
+            # استعادة حالة الذكاء الاصطناعي
+            session.api_key = api_key if api_key else None
+            if session.api_key:
+                session._init_ai()
+            print(f"{Colors.GREEN}✅ تم تحميل الجلسة: {session.target} - {session.platform}{Colors.ENDC}")
+            meth = Methodology(session)
+            # يمكن إضافة خيار للاستمرار من حيث توقفنا
+            meth.run()
+        except Exception as e:
+            print(f"{Colors.FAIL}خطأ في تحميل الجلسة: {e}{Colors.ENDC}")
+    else:
+        print("مع السلامة!")
+        sys.exit()
 
-
-# -----------------------------
-# GUI
-# -----------------------------
-class GhenaCTFAcademy(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("GHENA CTF ACADEMY")
-        self.setMinimumSize(900, 600)
-        self.engine = LabEngine()
-        self.init_ui()
-
-    def init_ui(self):
-        main = QWidget()
-        layout = QVBoxLayout()
-
-        title = QLabel("🎓 GHENA CTF ACADEMY\nBeginner Training Lab")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet("font-size: 22px; font-weight: bold;")
-
-        self.stage_box = QGroupBox("Stage Explanation")
-        stage_layout = QVBoxLayout()
-        self.lesson_area = QTextEdit()
-        self.lesson_area.setReadOnly(True)
-        stage_layout.addWidget(self.lesson_area)
-        self.stage_box.setLayout(stage_layout)
-
-        self.result_box = QGroupBox("Lab Result")
-        result_layout = QVBoxLayout()
-        self.result_area = QTextEdit()
-        self.result_area.setReadOnly(True)
-        result_layout.addWidget(self.result_area)
-        self.result_box.setLayout(result_layout)
-
-        self.btn_next = QPushButton("▶ Next Step")
-        self.btn_next.setStyleSheet("font-size: 16px; padding: 10px;")
-        self.btn_next.clicked.connect(self.next_step)
-
-        layout.addWidget(title)
-        layout.addWidget(self.stage_box)
-        layout.addWidget(self.result_box)
-        layout.addWidget(self.btn_next)
-
-        main.setLayout(layout)
-        self.setCentralWidget(main)
-
-        self.next_step()
-
-    def next_step(self):
-        data = self.engine.next_stage()
-        if not data:
-            self.lesson_area.setText("🎉 LAB COMPLETED!\nYou are ready for the next lab.")
-            self.result_area.clear()
-            self.btn_next.setEnabled(False)
-            return
-
-        self.stage_box.setTitle(data["title"])
-        self.lesson_area.setText(data["lesson"])
-        self.result_area.setText(data["result"])
-
-
-# -----------------------------
-# RUN
-# -----------------------------
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    win = GhenaCTFAcademy()
-    win.show()
-    sys.exit(app.exec())
+    main()
