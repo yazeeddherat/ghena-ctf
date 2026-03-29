@@ -1,691 +1,815 @@
+# =====================================================
+# Bug Bounty Scanner Pro v4.1 — Public + Secured
+# تشغيل: python scanner_final.py
+# =====================================================
 
-<!DOCTYPE html>
+from flask import Flask, request, jsonify, make_response
+import requests as req
+import socket, ssl, os, re, json, time, logging, hashlib
+from urllib.parse import urlparse, urljoin
+from bs4 import BeautifulSoup
+from datetime import datetime
+from collections import defaultdict
+import secrets
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
+
+# =====================================================
+# إعدادات الأمان
+# =====================================================
+CONFIG = {
+    # Rate Limiting
+    'MAX_SCANS_PER_HOUR': 20,
+    'MAX_SCANS_PER_MINUTE': 2,
+
+    # Blacklist — مواقع ممنوع فحصها
+    'BLOCKED_DOMAINS': [
+        'google.com', 'facebook.com', 'twitter.com', 'x.com',
+        'instagram.com', 'youtube.com', 'amazon.com', 'microsoft.com',
+        'apple.com', 'cloudflare.com', 'gov.jo', 'mod.gov.jo',
+        'yahoo.com', 'linkedin.com', 'tiktok.com', 'netflix.com',
+        'whatsapp.com', 'telegram.org', 'paypal.com', 'visa.com',
+    ],
+
+    # Max scan duration
+    'SCAN_TIMEOUT': 30,
+}
+
+# =====================================================
+# Rate Limiter
+# =====================================================
+scan_counts_hour   = defaultdict(list)
+scan_counts_minute = defaultdict(list)
+blocked_ips        = {}
+
+def get_ip():
+    return request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
+
+def check_rate_limit(ip):
+    now = time.time()
+
+    # تنظيف القوائم القديمة
+    scan_counts_hour[ip]   = [t for t in scan_counts_hour[ip]   if t > now - 3600]
+    scan_counts_minute[ip] = [t for t in scan_counts_minute[ip] if t > now - 60]
+
+    # فحص الحد في الساعة
+    if len(scan_counts_hour[ip]) >= CONFIG['MAX_SCANS_PER_HOUR']:
+        return False, f'تجاوزت الحد المسموح ({CONFIG["MAX_SCANS_PER_HOUR"]} فحص/ساعة) — انتظر قليلاً'
+
+    # فحص الحد في الدقيقة
+    if len(scan_counts_minute[ip]) >= CONFIG['MAX_SCANS_PER_MINUTE']:
+        return False, f'سرعة فحص عالية — انتظر 30 ثانية'
+
+    return True, ''
+
+def record_scan(ip):
+    now = time.time()
+    scan_counts_hour[ip].append(now)
+    scan_counts_minute[ip].append(now)
+
+# =====================================================
+# Logging
+# =====================================================
+logging.basicConfig(
+    filename='scanner_audit.log',
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s'
+)
+
+def log_event(event_type, message):
+    try:
+        ip = get_ip()
+    except:
+        ip = 'SYSTEM'
+    logging.info(f'{event_type} | IP:{ip} | {message}')
+
+# =====================================================
+# URL Validator
+# =====================================================
+def validate_url(url):
+    if not url:
+        return False, 'الرجاء إدخال رابط'
+
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower().replace('www.', '')
+
+        if not domain:
+            return False, 'رابط غير صالح'
+
+        # منع Local IPs
+        local_patterns = [
+            r'^localhost$', r'^127\.', r'^192\.168\.',
+            r'^10\.', r'^172\.(1[6-9]|2[0-9]|3[0-1])\.',
+            r'^0\.0\.0\.0$', r'^::1$', r'^169\.254\.',
+        ]
+        for pattern in local_patterns:
+            if re.match(pattern, domain):
+                return False, '⛔ لا يمكن فحص عناوين الشبكة المحلية'
+
+        # منع IP مباشر
+        if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', domain):
+            octets = list(map(int, domain.split('.')))
+            if octets[0] in (10, 127) or (octets[0]==172 and 16<=octets[1]<=31) or (octets[0]==192 and octets[1]==168):
+                return False, '⛔ لا يمكن فحص IPs المحلية'
+
+        # Blacklist
+        for blocked in CONFIG['BLOCKED_DOMAINS']:
+            if blocked in domain:
+                return False, f'⛔ الموقع {blocked} محظور الفحص'
+
+        # التحقق من DNS
+        try:
+            socket.gethostbyname(parsed.netloc)
+        except socket.gaierror:
+            return False, f'⛔ لا يمكن الوصول للدومين: {parsed.netloc}'
+
+        return True, url
+
+    except Exception as e:
+        return False, f'رابط غير صالح: {str(e)}'
+
+# =====================================================
+# Security Headers للردود
+# =====================================================
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options']        = 'DENY'
+    response.headers['X-XSS-Protection']       = '1; mode=block'
+    response.headers['Referrer-Policy']        = 'strict-origin-when-cross-origin'
+    response.headers['Cache-Control']          = 'no-store, no-cache'
+    return response
+
+# =====================================================
+# HTML
+# =====================================================
+MAIN_HTML = '''<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Web Security Scanner</title>
+<title>Bug Bounty Scanner Pro</title>
+<meta http-equiv="X-Frame-Options" content="DENY">
+<meta http-equiv="X-Content-Type-Options" content="nosniff">
+<meta name="referrer" content="no-referrer">
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Cairo:wght@400;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Cairo:wght@400;600;700&display=swap');
+:root{--bg:#060910;--bg2:#0d1117;--border:#21262d;--accent:#58a6ff;--accent2:#1f6feb;--red:#f85149;--orange:#d29922;--green:#3fb950;--purple:#bc8cff;--text:#c9d1d9;--text2:#8b949e;--mono:'IBM Plex Mono',monospace;--sans:'Cairo',sans-serif;}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 20% 20%,rgba(88,166,255,0.04) 0%,transparent 50%),radial-gradient(ellipse at 80% 80%,rgba(188,140,255,0.04) 0%,transparent 50%);pointer-events:none;z-index:0;}
 
-  :root {
-    --bg: #0a0d14;
-    --bg2: #111520;
-    --bg3: #181d2e;
-    --border: #1e2540;
-    --accent: #00d4ff;
-    --accent2: #0099cc;
-    --red: #ff4444;
-    --orange: #ff8800;
-    --green: #00cc66;
-    --text: #e0e8ff;
-    --text2: #7a8ab0;
-    --mono: 'IBM Plex Mono', monospace;
-    --sans: 'Cairo', sans-serif;
-  }
+header{position:relative;z-index:1;padding:20px 40px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px;background:rgba(13,17,23,0.9);backdrop-filter:blur(10px);}
+.logo-icon{width:38px;height:38px;background:linear-gradient(135deg,var(--accent),var(--purple));border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;}
+header h1{font-size:14px;font-weight:700;color:var(--text);letter-spacing:2px;font-family:var(--mono);}
+header p{font-size:10px;color:var(--text2);font-family:var(--mono);}
+.hbadges{margin-right:auto;margin-left:0;display:flex;gap:8px;flex-wrap:wrap;}
+.hbadge{font-size:9px;font-family:var(--mono);padding:3px 8px;border-radius:3px;border:1px solid;display:flex;align-items:center;gap:4px;}
+.hb-green{background:rgba(63,185,80,0.08);border-color:rgba(63,185,80,0.25);color:var(--green);}
+.hb-blue{background:rgba(88,166,255,0.08);border-color:rgba(88,166,255,0.25);color:var(--accent);}
+.dot-anim{width:5px;height:5px;border-radius:50%;background:currentColor;animation:pulse 1.5s infinite;}
+@keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.3;}}
 
-  * { margin: 0; padding: 0; box-sizing: border-box; }
+main{position:relative;z-index:1;max-width:920px;margin:28px auto;padding:0 24px;}
 
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--sans);
-    min-height: 100vh;
-  }
+.sec-status{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;padding:10px 16px;background:var(--bg2);border:1px solid rgba(63,185,80,0.15);border-radius:8px;}
+.ss-item{font-family:var(--mono);font-size:9px;color:var(--text2);display:flex;align-items:center;gap:5px;}
+.ss-dot{width:5px;height:5px;border-radius:50%;background:var(--green);}
+.ss-orange{background:var(--orange);}
 
-  /* grid bg */
-  body::before {
-    content: '';
-    position: fixed;
-    inset: 0;
-    background-image:
-      linear-gradient(rgba(0,212,255,0.03) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(0,212,255,0.03) 1px, transparent 1px);
-    background-size: 40px 40px;
-    pointer-events: none;
-    z-index: 0;
-  }
+.scan-box{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:16px;}
+.scan-label{font-size:11px;font-family:var(--mono);color:var(--accent);margin-bottom:10px;letter-spacing:2px;}
+.input-row{display:flex;gap:10px;}
+.input-row input{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px 16px;color:var(--text);font-family:var(--mono);font-size:13px;direction:ltr;outline:none;transition:all 0.2s;}
+.input-row input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,0.08);}
+.input-row input::placeholder{color:var(--text2);}
+#scanBtn{background:var(--accent2);color:#fff;border:1px solid var(--accent);border-radius:8px;padding:12px 24px;font-family:var(--mono);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;transition:all 0.2s;letter-spacing:1px;}
+#scanBtn:hover{background:var(--accent);}
+#scanBtn:disabled{background:var(--border);color:var(--text2);cursor:not-allowed;border-color:var(--border);}
+.meta-row{display:flex;justify-content:space-between;align-items:center;margin-top:10px;flex-wrap:wrap;gap:8px;}
+.warning-bar{padding:7px 12px;background:rgba(210,153,34,0.07);border:1px solid rgba(210,153,34,0.2);border-radius:6px;font-size:10px;color:var(--orange);font-family:var(--mono);}
+.rate-bar{font-family:var(--mono);font-size:10px;color:var(--text2);}
+.rate-bar span{color:var(--accent);}
 
-  header {
-    position: relative;
-    z-index: 1;
-    padding: 32px 40px 28px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    gap: 16px;
-  }
+.modules-wrap{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:18px 24px;margin-bottom:16px;}
+.modules-title{font-size:11px;font-family:var(--mono);color:var(--text2);letter-spacing:2px;margin-bottom:12px;}
+.modules-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(175px,1fr));gap:7px;}
+.module-btn{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:7px 12px;font-family:var(--mono);font-size:11px;color:var(--text2);cursor:pointer;transition:all 0.2s;display:flex;align-items:center;gap:8px;}
+.module-btn.active{border-color:var(--accent);color:var(--accent);background:rgba(88,166,255,0.05);}
+.module-btn .dot{width:6px;height:6px;border-radius:50%;background:var(--border);flex-shrink:0;transition:background 0.2s;}
+.module-btn.active .dot{background:var(--accent);}
 
-  .shield {
-    width: 44px; height: 44px;
-    background: linear-gradient(135deg, var(--accent), var(--accent2));
-    border-radius: 10px;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 22px;
-    flex-shrink: 0;
-  }
+#loadingBox{display:none;background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:28px;margin-bottom:16px;}
+.load-header{display:flex;align-items:center;gap:12px;margin-bottom:20px;}
+.spinner{width:20px;height:20px;border:2px solid var(--border);border-top:2px solid var(--accent);border-radius:50%;animation:spin 0.7s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+.scan-target-txt{font-family:var(--mono);font-size:13px;color:var(--accent);}
+.progress-bar-wrap{background:var(--bg);border-radius:4px;height:3px;margin-bottom:16px;overflow:hidden;}
+.progress-bar{height:100%;background:linear-gradient(90deg,var(--accent),var(--purple));width:0%;transition:width 0.5s;border-radius:4px;}
+.steps-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:7px;}
+.step{font-family:var(--mono);font-size:11px;padding:7px 12px;border-radius:6px;border:1px solid var(--border);color:var(--text2);transition:all 0.3s;display:flex;align-items:center;gap:8px;}
+.step .si{width:6px;height:6px;border-radius:50%;background:var(--border);flex-shrink:0;}
+.step.active{border-color:var(--accent);color:var(--accent);background:rgba(88,166,255,0.05);}
+.step.active .si{background:var(--accent);animation:pulse 1s infinite;}
+.step.done{border-color:var(--green);color:var(--green);background:rgba(63,185,80,0.05);}
+.step.done .si{background:var(--green);}
 
-  header h1 {
-    font-size: 20px;
-    font-weight: 700;
-    color: var(--text);
-    letter-spacing: 1px;
-  }
+.cards-row{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-bottom:16px;}
+@media(max-width:640px){.cards-row{grid-template-columns:repeat(3,1fr);}}
+.card{border-radius:10px;padding:16px 12px;text-align:center;border:1px solid transparent;}
+.card-num{font-size:26px;font-weight:700;font-family:var(--mono);}
+.card-lbl{font-size:10px;margin-top:4px;font-family:var(--mono);letter-spacing:1px;}
+.c-blue{background:rgba(88,166,255,0.08);border-color:rgba(88,166,255,0.2);}.c-blue .card-num{color:var(--accent);}.c-blue .card-lbl{color:#4d8fcc;}
+.c-red{background:rgba(248,81,73,0.08);border-color:rgba(248,81,73,0.2);}.c-red .card-num{color:var(--red);}.c-red .card-lbl{color:#c44040;}
+.c-orange{background:rgba(210,153,34,0.08);border-color:rgba(210,153,34,0.2);}.c-orange .card-num{color:var(--orange);}.c-orange .card-lbl{color:#a87c1a;}
+.c-green{background:rgba(63,185,80,0.08);border-color:rgba(63,185,80,0.2);}.c-green .card-num{color:var(--green);}.c-green .card-lbl{color:#2d8f3f;}
+.c-purple{background:rgba(188,140,255,0.08);border-color:rgba(188,140,255,0.2);}.c-purple .card-num{color:var(--purple);}.c-purple .card-lbl{color:#8c66cc;}
 
-  header p {
-    font-size: 13px;
-    color: var(--text2);
-    margin-top: 2px;
-    font-family: var(--mono);
-  }
+.section{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:14px;}
+.sec-title{font-size:11px;font-family:var(--mono);color:var(--text2);letter-spacing:2px;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;}
+.sec-title span{color:var(--accent);}
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
+@media(max-width:580px){.info-grid{grid-template-columns:1fr;}}
+.info-item{display:flex;gap:10px;padding:7px 10px;background:var(--bg);border-radius:6px;border:1px solid var(--border);}
+.info-key{font-family:var(--mono);font-size:10px;color:var(--text2);min-width:120px;}
+.info-val{font-family:var(--mono);font-size:10px;color:var(--text);direction:ltr;word-break:break-all;}
 
-  .tag {
-    margin-right: auto;
-    margin-left: 0;
-    background: rgba(0,212,255,0.08);
-    border: 1px solid rgba(0,212,255,0.2);
-    color: var(--accent);
-    font-size: 11px;
-    font-family: var(--mono);
-    padding: 4px 10px;
-    border-radius: 4px;
-  }
+.vuln-card{border-radius:8px;overflow:hidden;margin-bottom:8px;border:1px solid var(--border);}
+.vuln-head{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;cursor:pointer;user-select:none;}
+.vuln-title{font-family:var(--mono);font-size:12px;font-weight:600;display:flex;align-items:center;gap:8px;}
+.vtag{font-size:9px;padding:2px 8px;border-radius:3px;font-family:var(--mono);letter-spacing:1px;}
+.vuln-high .vuln-head{background:rgba(248,81,73,0.08);border-bottom:1px solid rgba(248,81,73,0.15);}
+.vuln-high .vuln-title{color:var(--red);}.vuln-high .vtag{background:rgba(248,81,73,0.15);color:var(--red);}
+.vuln-medium .vuln-head{background:rgba(210,153,34,0.08);border-bottom:1px solid rgba(210,153,34,0.15);}
+.vuln-medium .vuln-title{color:var(--orange);}.vuln-medium .vtag{background:rgba(210,153,34,0.15);color:var(--orange);}
+.vuln-low .vuln-head{background:rgba(63,185,80,0.08);border-bottom:1px solid rgba(63,185,80,0.15);}
+.vuln-low .vuln-title{color:var(--green);}.vuln-low .vtag{background:rgba(63,185,80,0.15);color:var(--green);}
+.vuln-info .vuln-head{background:rgba(88,166,255,0.08);border-bottom:1px solid rgba(88,166,255,0.15);}
+.vuln-info .vuln-title{color:var(--accent);}.vuln-info .vtag{background:rgba(88,166,255,0.15);color:var(--accent);}
+.vuln-body{padding:12px 14px;background:var(--bg);display:none;}
+.vuln-body.open{display:block;}
+.vuln-row{display:flex;gap:10px;margin-bottom:7px;font-size:12px;}
+.vuln-row:last-child{margin-bottom:0;}
+.vl{font-family:var(--mono);font-size:10px;color:var(--text2);min-width:100px;padding-top:2px;flex-shrink:0;}
+.vv{color:var(--text);line-height:1.7;font-size:12px;}
+.evidence{background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--purple);margin-top:4px;word-break:break-all;}
 
-  main {
-    position: relative;
-    z-index: 1;
-    max-width: 860px;
-    margin: 40px auto;
-    padding: 0 24px;
-  }
-
-  .scan-box {
-    background: var(--bg2);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 36px;
-    margin-bottom: 28px;
-  }
-
-  .scan-box label {
-    display: block;
-    font-size: 13px;
-    font-family: var(--mono);
-    color: var(--accent);
-    margin-bottom: 10px;
-    letter-spacing: 1px;
-  }
-
-  .input-row {
-    display: flex;
-    gap: 10px;
-  }
-
-  .input-row input {
-    flex: 1;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 13px 16px;
-    color: var(--text);
-    font-family: var(--mono);
-    font-size: 14px;
-    direction: ltr;
-    outline: none;
-    transition: border-color 0.2s;
-  }
-
-  .input-row input:focus { border-color: var(--accent); }
-  .input-row input::placeholder { color: var(--text2); }
-
-  #scanBtn {
-    background: var(--accent);
-    color: #000;
-    border: none;
-    border-radius: 8px;
-    padding: 13px 28px;
-    font-family: var(--sans);
-    font-size: 14px;
-    font-weight: 700;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: all 0.2s;
-  }
-
-  #scanBtn:hover { background: #00eeff; transform: translateY(-1px); }
-  #scanBtn:disabled { background: #1e2540; color: var(--text2); cursor: not-allowed; transform: none; }
-
-  .warning {
-    margin-top: 12px;
-    font-size: 12px;
-    color: var(--orange);
-    font-family: var(--mono);
-  }
-
-  /* Loading */
-  #loadingBox {
-    display: none;
-    background: var(--bg2);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 36px;
-    margin-bottom: 28px;
-    text-align: center;
-  }
-
-  .spinner-wrap {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 12px;
-    margin-bottom: 24px;
-  }
-
-  .spinner {
-    width: 24px; height: 24px;
-    border: 2px solid var(--border);
-    border-top: 2px solid var(--accent);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-  }
-
-  @keyframes spin { to { transform: rotate(360deg); } }
-
-  .scanning-text {
-    font-family: var(--mono);
-    font-size: 14px;
-    color: var(--accent);
-  }
-
-  .steps-grid {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    justify-content: center;
-  }
-
-  .step {
-    font-family: var(--mono);
-    font-size: 12px;
-    padding: 5px 14px;
-    border-radius: 4px;
-    border: 1px solid var(--border);
-    color: var(--text2);
-    transition: all 0.3s;
-  }
-
-  .step.active { border-color: var(--accent); color: var(--accent); background: rgba(0,212,255,0.07); }
-  .step.done { border-color: var(--green); color: var(--green); background: rgba(0,204,102,0.07); }
-
-  /* Summary cards */
-  .cards-row {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0,1fr));
-    gap: 12px;
-    margin-bottom: 24px;
-  }
-
-  @media(max-width:580px) { .cards-row { grid-template-columns: repeat(2,1fr); } }
-
-  .card {
-    border-radius: 12px;
-    padding: 20px 16px;
-    text-align: center;
-    border: 1px solid transparent;
-  }
-
-  .card-num { font-size: 32px; font-weight: 700; font-family: var(--mono); }
-  .card-lbl { font-size: 12px; margin-top: 4px; font-family: var(--mono); }
-
-  .card-total  { background: rgba(0,212,255,0.08); border-color: rgba(0,212,255,0.2); }
-  .card-total  .card-num { color: var(--accent); }
-  .card-total  .card-lbl { color: var(--accent2); }
-
-  .card-high   { background: rgba(255,68,68,0.08); border-color: rgba(255,68,68,0.2); }
-  .card-high   .card-num { color: var(--red); }
-  .card-high   .card-lbl { color: #cc3333; }
-
-  .card-medium { background: rgba(255,136,0,0.08); border-color: rgba(255,136,0,0.2); }
-  .card-medium .card-num { color: var(--orange); }
-  .card-medium .card-lbl { color: #cc7700; }
-
-  .card-low    { background: rgba(0,204,102,0.08); border-color: rgba(0,204,102,0.2); }
-  .card-low    .card-num { color: var(--green); }
-  .card-low    .card-lbl { color: #009944; }
-
-  /* Sections */
-  .section {
-    background: var(--bg2);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 24px;
-    margin-bottom: 20px;
-  }
-
-  .section-title {
-    font-size: 13px;
-    font-family: var(--mono);
-    color: var(--accent);
-    letter-spacing: 1px;
-    margin-bottom: 16px;
-    padding-bottom: 12px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  /* Info items */
-  .info-item {
-    display: flex;
-    gap: 12px;
-    padding: 9px 12px;
-    background: var(--bg);
-    border-radius: 6px;
-    margin-bottom: 6px;
-    border: 1px solid var(--border);
-  }
-
-  .info-key {
-    font-family: var(--mono);
-    font-size: 12px;
-    color: var(--accent2);
-    min-width: 140px;
-  }
-
-  .info-val {
-    font-family: var(--mono);
-    font-size: 12px;
-    color: var(--text);
-    direction: ltr;
-    word-break: break-all;
-  }
-
-  /* Vuln cards */
-  .vuln-card {
-    border-radius: 10px;
-    overflow: hidden;
-    margin-bottom: 12px;
-    border: 1px solid var(--border);
-  }
-
-  .vuln-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 12px 16px;
-  }
-
-  .vuln-head-title {
-    font-family: var(--mono);
-    font-size: 13px;
-    font-weight: 600;
-  }
-
-  .badge {
-    font-family: var(--mono);
-    font-size: 11px;
-    padding: 3px 10px;
-    border-radius: 4px;
-  }
-
-  .vuln-high .vuln-head { background: rgba(255,68,68,0.12); border-bottom: 1px solid rgba(255,68,68,0.2); }
-  .vuln-high .vuln-head-title { color: var(--red); }
-  .vuln-high .badge { background: rgba(255,68,68,0.15); color: var(--red); }
-
-  .vuln-medium .vuln-head { background: rgba(255,136,0,0.12); border-bottom: 1px solid rgba(255,136,0,0.2); }
-  .vuln-medium .vuln-head-title { color: var(--orange); }
-  .vuln-medium .badge { background: rgba(255,136,0,0.15); color: var(--orange); }
-
-  .vuln-low .vuln-head { background: rgba(0,204,102,0.12); border-bottom: 1px solid rgba(0,204,102,0.2); }
-  .vuln-low .vuln-head-title { color: var(--green); }
-  .vuln-low .badge { background: rgba(0,204,102,0.15); color: var(--green); }
-
-  .vuln-body {
-    padding: 14px 16px;
-    background: var(--bg);
-  }
-
-  .vuln-row {
-    display: flex;
-    gap: 10px;
-    margin-bottom: 8px;
-    font-size: 13px;
-  }
-
-  .vuln-row:last-child { margin-bottom: 0; }
-
-  .vuln-lbl {
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--text2);
-    min-width: 80px;
-    padding-top: 2px;
-  }
-
-  .vuln-val { color: var(--text); line-height: 1.6; }
-
-  /* Download btn */
-  .dl-wrap { text-align: center; padding: 10px 0 20px; }
-
-  .dl-btn {
-    background: transparent;
-    border: 1px solid var(--green);
-    color: var(--green);
-    padding: 12px 36px;
-    border-radius: 8px;
-    font-family: var(--sans);
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.2s;
-    font-family: var(--mono);
-  }
-
-  .dl-btn:hover { background: rgba(0,204,102,0.1); transform: translateY(-1px); }
-
-  /* Error */
-  .error-box {
-    display: none;
-    background: rgba(255,68,68,0.08);
-    border: 1px solid rgba(255,68,68,0.3);
-    border-radius: 10px;
-    padding: 16px 20px;
-    margin-bottom: 20px;
-    font-family: var(--mono);
-    font-size: 13px;
-    color: var(--red);
-  }
-
-  .no-vulns {
-    text-align: center;
-    padding: 24px;
-    color: var(--green);
-    font-family: var(--mono);
-    font-size: 14px;
-  }
-
-  footer {
-    position: relative;
-    z-index: 1;
-    text-align: center;
-    padding: 24px;
-    color: var(--text2);
-    font-family: var(--mono);
-    font-size: 11px;
-    border-top: 1px solid var(--border);
-    margin-top: 20px;
-  }
+.tabs{display:flex;gap:4px;margin-bottom:12px;flex-wrap:wrap;}
+.tab{font-family:var(--mono);font-size:11px;padding:5px 12px;border-radius:4px;border:1px solid var(--border);color:var(--text2);cursor:pointer;transition:all 0.2s;}
+.tab.active{border-color:var(--accent);color:var(--accent);background:rgba(88,166,255,0.05);}
+.dl-wrap{display:flex;gap:10px;justify-content:center;padding:8px 0 14px;flex-wrap:wrap;}
+.dl-btn{background:transparent;border:1px solid;padding:10px 24px;border-radius:6px;font-family:var(--mono);font-size:11px;cursor:pointer;transition:all 0.2s;letter-spacing:1px;}
+.dl-txt{border-color:var(--green);color:var(--green);}.dl-txt:hover{background:rgba(63,185,80,0.08);}
+.dl-json{border-color:var(--purple);color:var(--purple);}.dl-json:hover{background:rgba(188,140,255,0.08);}
+.error-box{display:none;background:rgba(248,81,73,0.06);border:1px solid rgba(248,81,73,0.2);border-radius:8px;padding:12px 16px;margin-bottom:14px;font-family:var(--mono);font-size:12px;color:var(--red);}
+.no-vulns{text-align:center;padding:24px;color:var(--green);font-family:var(--mono);font-size:13px;}
+footer{position:relative;z-index:1;text-align:center;padding:18px;color:var(--text2);font-family:var(--mono);font-size:10px;border-top:1px solid var(--border);margin-top:14px;}
 </style>
 </head>
 <body>
-
 <header>
-  <div class="shield">🛡️</div>
+  <div class="logo-icon">🛡️</div>
   <div>
-    <h1>WEB SECURITY SCANNER</h1>
-    <p>Vulnerability Detection & Reporting System</p>
+    <h1>BUG BOUNTY SCANNER PRO</h1>
+    <p>Secured v4.1 — Public Access</p>
   </div>
-  <div class="tag">v1.0 — DEMO</div>
+  <div class="hbadges">
+    <div class="hbadge hb-green"><span class="dot-anim"></span>LIVE</div>
+    <div class="hbadge hb-blue">12 MODULES</div>
+    <div class="hbadge hb-green">SECURED</div>
+  </div>
 </header>
 
 <main>
+  <div class="sec-status">
+    <div class="ss-item"><span class="ss-dot"></span>Rate Limiting</div>
+    <div class="ss-item"><span class="ss-dot"></span>Input Validation</div>
+    <div class="ss-item"><span class="ss-dot"></span>IP Blacklist Protection</div>
+    <div class="ss-item"><span class="ss-dot"></span>Local Network Blocked</div>
+    <div class="ss-item"><span class="ss-dot"></span>Audit Logging</div>
+    <div class="ss-item"><span class="ss-dot"></span>Security Headers</div>
+    <div class="ss-item" id="rateStatus"><span class="ss-dot"></span><span id="rateText">جاري التحميل...</span></div>
+  </div>
 
   <div class="scan-box">
-    <label>// TARGET URL</label>
+    <div class="scan-label">// TARGET URL</div>
     <div class="input-row">
-      <input type="text" id="urlInput" placeholder="https://example.com" autocomplete="off" />
-      <button id="scanBtn" onclick="startScan()">▶ ابدأ الفحص</button>
+      <input type="text" id="urlInput" placeholder="https://target.example.com" autocomplete="off" spellcheck="false"/>
+      <button id="scanBtn" onclick="startScan()">▶ SCAN</button>
     </div>
-    <div class="warning">⚠ استخدم هذه الأداة فقط على مواقع تملكها أو لديك إذن صريح بفحصها</div>
+    <div class="meta-row">
+      <div class="warning-bar">⚠ Bug Bounty Programs أو مواقعك فقط — كل فحص يُسجَّل</div>
+      <div class="rate-bar">متاح: <span id="rateCount">—</span> فحص/ساعة</div>
+    </div>
+  </div>
+
+  <div class="modules-wrap">
+    <div class="modules-title">// SCAN MODULES — اضغط لتفعيل/تعطيل</div>
+    <div class="modules-grid" id="modulesGrid">
+      <div class="module-btn active" data-mod="ssl"><span class="dot"></span>SSL/TLS</div>
+      <div class="module-btn active" data-mod="headers"><span class="dot"></span>Security Headers</div>
+      <div class="module-btn active" data-mod="sql"><span class="dot"></span>SQL Injection</div>
+      <div class="module-btn active" data-mod="xss"><span class="dot"></span>XSS</div>
+      <div class="module-btn active" data-mod="files"><span class="dot"></span>Sensitive Files</div>
+      <div class="module-btn active" data-mod="cors"><span class="dot"></span>CORS</div>
+      <div class="module-btn active" data-mod="csrf"><span class="dot"></span>CSRF</div>
+      <div class="module-btn active" data-mod="cookies"><span class="dot"></span>Cookie Security</div>
+      <div class="module-btn active" data-mod="redirect"><span class="dot"></span>Open Redirect</div>
+      <div class="module-btn active" data-mod="api"><span class="dot"></span>API Endpoints</div>
+      <div class="module-btn active" data-mod="info"><span class="dot"></span>Info Disclosure</div>
+      <div class="module-btn active" data-mod="dns"><span class="dot"></span>DNS</div>
+    </div>
   </div>
 
   <div id="loadingBox">
-    <div class="spinner-wrap">
+    <div class="load-header">
       <div class="spinner"></div>
-      <span class="scanning-text" id="scanningLabel">SCANNING...</span>
+      <span class="scan-target-txt" id="scanLabel">INITIALIZING...</span>
     </div>
-    <div class="steps-grid">
-      <span class="step" id="s1">SSL/TLS</span>
-      <span class="step" id="s2">SEC HEADERS</span>
-      <span class="step" id="s3">SQL INJECTION</span>
-      <span class="step" id="s4">XSS</span>
-      <span class="step" id="s5">SENSITIVE FILES</span>
-      <span class="step" id="s6">DNS</span>
-    </div>
+    <div class="progress-bar-wrap"><div class="progress-bar" id="progressBar"></div></div>
+    <div class="steps-grid" id="stepsGrid"></div>
   </div>
 
   <div class="error-box" id="errorBox"></div>
 
   <div id="resultsBox" style="display:none;">
     <div class="cards-row">
-      <div class="card card-total"><div class="card-num" id="cTotal">0</div><div class="card-lbl">TOTAL</div></div>
-      <div class="card card-high"><div class="card-num" id="cHigh">0</div><div class="card-lbl">HIGH</div></div>
-      <div class="card card-medium"><div class="card-num" id="cMed">0</div><div class="card-lbl">MEDIUM</div></div>
-      <div class="card card-low"><div class="card-num" id="cLow">0</div><div class="card-lbl">LOW</div></div>
+      <div class="card c-blue"><div class="card-num" id="cTotal">0</div><div class="card-lbl">TOTAL</div></div>
+      <div class="card c-red"><div class="card-num" id="cHigh">0</div><div class="card-lbl">CRITICAL</div></div>
+      <div class="card c-orange"><div class="card-num" id="cMed">0</div><div class="card-lbl">MEDIUM</div></div>
+      <div class="card c-green"><div class="card-num" id="cLow">0</div><div class="card-lbl">LOW</div></div>
+      <div class="card c-purple"><div class="card-num" id="cInfo">0</div><div class="card-lbl">INFO</div></div>
     </div>
-
     <div class="section">
-      <div class="section-title">◈ SCAN INFO</div>
-      <div id="infoList"></div>
+      <div class="sec-title"><span>◈</span> TARGET INFORMATION</div>
+      <div class="info-grid" id="infoList"></div>
     </div>
-
     <div class="section">
-      <div class="section-title">◈ VULNERABILITIES</div>
+      <div class="sec-title"><span>◈</span> VULNERABILITIES</div>
+      <div class="tabs">
+        <div class="tab active" onclick="filterVulns('all',this)">ALL</div>
+        <div class="tab" onclick="filterVulns('high',this)">CRITICAL</div>
+        <div class="tab" onclick="filterVulns('medium',this)">MEDIUM</div>
+        <div class="tab" onclick="filterVulns('low',this)">LOW</div>
+        <div class="tab" onclick="filterVulns('info',this)">INFO</div>
+      </div>
       <div id="vulnList"></div>
     </div>
-
     <div class="dl-wrap">
-      <button class="dl-btn" onclick="downloadReport()">⬇ تحميل التقرير TXT</button>
+      <button class="dl-btn dl-txt" onclick="downloadTxt()">⬇ REPORT.TXT</button>
+      <button class="dl-btn dl-json" onclick="downloadJson()">⬇ REPORT.JSON</button>
     </div>
   </div>
-
 </main>
 
-<footer>WEB SECURITY SCANNER — FOR AUTHORIZED USE ONLY — © 2025</footer>
+<footer>BUG BOUNTY SCANNER PRO v4.1 — ALL SCANS LOGGED — AUTHORIZED USE ONLY</footer>
 
 <script>
-// =====================
-// بيانات الفحص الوهمية (Demo)
-// =====================
-// ملاحظة: هذا demo يعمل في المتصفح مباشرة
-// للفحص الحقيقي شغّل app.py على جهازك
+let scanReport=null, allVulns=[];
+let activeModules=new Set(['ssl','headers','sql','xss','files','cors','csrf','cookies','redirect','api','info','dns']);
+const STEPS=[{id:'ssl',label:'SSL/TLS'},{id:'headers',label:'SEC HEADERS'},{id:'sql',label:'SQL INJECTION'},{id:'xss',label:'XSS'},{id:'files',label:'SENSITIVE FILES'},{id:'cors',label:'CORS'},{id:'csrf',label:'CSRF'},{id:'cookies',label:'COOKIES'},{id:'redirect',label:'OPEN REDIRECT'},{id:'api',label:'API ENDPOINTS'},{id:'info',label:'INFO DISCLOSURE'},{id:'dns',label:'DNS'}];
 
-const DEMO_VULNS = {
-  ssl: {
-    missing: { type:'Missing HTTPS', severity:'high', description:'الموقع لا يستخدم HTTPS — البيانات تنتقل بدون تشفير', recommendation:'استخدم شهادة SSL وحوّل كل الطلبات من HTTP إلى HTTPS' },
-    expiring: { type:'SSL Certificate Expiring', severity:'medium', description:'شهادة SSL ستنتهي خلال 15 يوم', recommendation:'جدد شهادة SSL قبل انتهائها' }
-  },
-  headers: [
-    { type:'Missing Header: X-Frame-Options', severity:'medium', description:'الموقع عرضة لهجمات Clickjacking', recommendation:'أضف: X-Frame-Options: DENY' },
-    { type:'Missing Header: Strict-Transport-Security', severity:'high', description:'لا يوجد HSTS — يمكن تحويل الاتصال لـ HTTP', recommendation:'أضف: Strict-Transport-Security: max-age=31536000' },
-    { type:'Missing Header: Content-Security-Policy', severity:'high', description:'لا يوجد CSP — الموقع عرضة لهجمات XSS المتقدمة', recommendation:'أضف Content-Security-Policy مناسب لموقعك' },
-    { type:'Server Version Disclosure', severity:'low', description:'الـ Server يكشف إصداره: Apache/2.4.51', recommendation:'أخفِ معلومات الـ Server من الهيدرز' }
-  ],
-  sql: { type:'SQL Injection', severity:'high', description:'تم اكتشاف ثغرة SQL Injection في نموذج تسجيل الدخول', recommendation:'استخدم Prepared Statements وتحقق من كل المدخلات' },
-  xss: { type:'XSS — Cross Site Scripting', severity:'high', description:'تم اكتشاف ثغرة XSS في حقل البحث', recommendation:'شفّر كل المدخلات قبل عرضها وفعّل CSP' },
-  files: [
-    { type:'Sensitive File Exposed', severity:'high', description:'ملف حساس مكشوف: /.env', recommendation:'احذف أو احمِ الوصول لملفات البيئة' },
-    { type:'Sensitive File Exposed', severity:'high', description:'ملف حساس مكشوف: /wp-config.php', recommendation:'انقل ملف الإعدادات خارج مجلد الويب' }
-  ],
-  dns: { type:'Missing SPF Record', severity:'medium', description:'لا يوجد SPF Record — الموقع عرضة لانتحال البريد', recommendation:'أضف SPF Record في إعدادات DNS' }
-};
+// Module toggle
+document.getElementById('modulesGrid').addEventListener('click',e=>{
+  const btn=e.target.closest('.module-btn');
+  if(!btn)return;
+  btn.classList.toggle('active');
+  const mod=btn.dataset.mod;
+  if(btn.classList.contains('active')) activeModules.add(mod);
+  else activeModules.delete(mod);
+});
 
-let scanReport = null;
-let stepTimer = null;
-
-async function startScan() {
-  const url = document.getElementById('urlInput').value.trim();
-  if (!url) { showError('الرجاء إدخال رابط الموقع'); return; }
-
-  document.getElementById('resultsBox').style.display = 'none';
-  document.getElementById('errorBox').style.display = 'none';
-  document.getElementById('loadingBox').style.display = 'block';
-  document.getElementById('scanBtn').disabled = true;
-  document.getElementById('scanBtn').textContent = '⏳ جاري الفحص...';
-
-  resetSteps();
-  await animateSteps();
-  await runDemoScan(url);
-
-  document.getElementById('loadingBox').style.display = 'none';
-  document.getElementById('scanBtn').disabled = false;
-  document.getElementById('scanBtn').textContent = '▶ ابدأ الفحص';
+async function loadStatus(){
+  try{
+    const r=await fetch('/status');
+    const d=await r.json();
+    document.getElementById('rateCount').textContent=d.remaining+'/'+d.max_hour;
+    document.getElementById('rateText').textContent=`فحوصات متاحة: ${d.remaining}`;
+    const dot=document.querySelector('#rateStatus .ss-dot');
+    dot.className='ss-dot'+(d.remaining>5?'':' ss-orange');
+  }catch(e){}
 }
+loadStatus();
 
-function resetSteps() {
-  for (let i = 1; i <= 6; i++) {
-    const el = document.getElementById('s'+i);
-    el.className = 'step';
-  }
-}
-
-async function animateSteps() {
-  const stepNames = ['SSL/TLS','SEC HEADERS','SQL INJECTION','XSS','SENSITIVE FILES','DNS'];
-  for (let i = 1; i <= 6; i++) {
-    document.getElementById('s'+i).className = 'step active';
-    document.getElementById('scanningLabel').textContent = 'SCANNING ' + stepNames[i-1] + '...';
-    await sleep(900);
-    document.getElementById('s'+i).className = 'step done';
-    document.getElementById('s'+i).textContent = '✓ ' + stepNames[i-1];
-  }
-  document.getElementById('scanningLabel').textContent = 'SCAN COMPLETE';
-}
-
-async function runDemoScan(url) {
-  const now = new Date().toLocaleString('ar-EG');
-  const isHttp = url.startsWith('http://');
-  const domain = url.replace(/https?:\/\//,'').split('/')[0];
-
-  const vulns = [];
-  const info = [
-    { title:'Target URL', value: url },
-    { title:'Domain', value: domain },
-    { title:'Scan Date', value: now },
-    { title:'IP Address', value: '104.21.' + Math.floor(Math.random()*255) + '.' + Math.floor(Math.random()*255) },
-    { title:'Server', value: 'Apache/2.4.51 (Unix)' },
-    { title:'SSL Certificate', value: isHttp ? 'غير متوفر' : 'ينتهي بعد 15 يوم' }
-  ];
-
-  if (isHttp) vulns.push({...DEMO_VULNS.ssl.missing, timestamp: now});
-  else vulns.push({...DEMO_VULNS.ssl.expiring, timestamp: now});
-
-  DEMO_VULNS.headers.forEach(h => vulns.push({...h, timestamp: now}));
-  vulns.push({...DEMO_VULNS.sql, timestamp: now});
-  vulns.push({...DEMO_VULNS.xss, timestamp: now});
-  DEMO_VULNS.files.forEach(f => vulns.push({...f, timestamp: now}));
-  vulns.push({...DEMO_VULNS.dns, timestamp: now});
-
-  const summary = {
-    total: vulns.length,
-    high: vulns.filter(v=>v.severity==='high').length,
-    medium: vulns.filter(v=>v.severity==='medium').length,
-    low: vulns.filter(v=>v.severity==='low').length
-  };
-
-  scanReport = { url, domain, date: now, vulns, info, summary };
-  showResults(scanReport);
-}
-
-function showResults(r) {
-  document.getElementById('cTotal').textContent = r.summary.total;
-  document.getElementById('cHigh').textContent  = r.summary.high;
-  document.getElementById('cMed').textContent   = r.summary.medium;
-  document.getElementById('cLow').textContent   = r.summary.low;
-
-  const infoList = document.getElementById('infoList');
-  infoList.innerHTML = '';
-  r.info.forEach(item => {
-    infoList.innerHTML += `
-      <div class="info-item">
-        <span class="info-key">${item.title}</span>
-        <span class="info-val">${item.value}</span>
-      </div>`;
+function buildSteps(){
+  const grid=document.getElementById('stepsGrid');
+  grid.innerHTML='';
+  STEPS.filter(s=>activeModules.has(s.id)).forEach(s=>{
+    grid.innerHTML+=`<div class="step" id="step_${s.id}"><span class="si"></span>${s.label}</div>`;
   });
+}
 
-  const vulnList = document.getElementById('vulnList');
-  vulnList.innerHTML = '';
+async function startScan(){
+  const url=document.getElementById('urlInput').value.trim();
+  if(!url){showError('الرجاء إدخال رابط الموقع');return;}
+  document.getElementById('resultsBox').style.display='none';
+  document.getElementById('errorBox').style.display='none';
+  document.getElementById('loadingBox').style.display='block';
+  document.getElementById('scanBtn').disabled=true;
+  document.getElementById('scanBtn').textContent='⏳ SCANNING...';
+  document.getElementById('progressBar').style.width='0%';
+  document.getElementById('scanLabel').textContent='VALIDATING: '+url;
+  buildSteps();
 
-  if (!r.vulns.length) {
-    vulnList.innerHTML = '<div class="no-vulns">✓ لم يتم اكتشاف ثغرات</div>';
-  } else {
-    const order = {high:0, medium:1, low:2};
-    const sorted = [...r.vulns].sort((a,b)=>order[a.severity]-order[b.severity]);
-    const sevLabel = {high:'HIGH ●', medium:'MEDIUM ●', low:'LOW ●'};
-    sorted.forEach((v,i) => {
-      vulnList.innerHTML += `
-        <div class="vuln-card vuln-${v.severity}">
-          <div class="vuln-head">
-            <span class="vuln-head-title">#${i+1} ${v.type}</span>
-            <span class="badge">${sevLabel[v.severity]}</span>
-          </div>
-          <div class="vuln-body">
-            <div class="vuln-row"><span class="vuln-lbl">DESCRIPTION</span><span class="vuln-val">${v.description}</span></div>
-            <div class="vuln-row"><span class="vuln-lbl">FIX</span><span class="vuln-val">${v.recommendation}</span></div>
-            <div class="vuln-row"><span class="vuln-lbl">TIME</span><span class="vuln-val" style="font-family:var(--mono);font-size:11px;">${v.timestamp}</span></div>
-          </div>
-        </div>`;
+  const steps=STEPS.filter(s=>activeModules.has(s.id));
+  let prog=0;
+  const iv=setInterval(()=>{
+    prog=Math.min(prog+(100/(steps.length+1)),95);
+    document.getElementById('progressBar').style.width=prog+'%';
+    const idx=Math.floor(prog/(100/(steps.length+1)));
+    steps.forEach((s,i)=>{
+      const el=document.getElementById('step_'+s.id);
+      if(!el)return;
+      if(i<idx)el.className='step done';
+      else if(i===idx)el.className='step active';
     });
-  }
+  },1500);
 
-  document.getElementById('resultsBox').style.display = 'block';
+  try{
+    const res=await fetch('/scan',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},
+      body:JSON.stringify({url,modules:[...activeModules]})
+    });
+    const data=await res.json();
+    clearInterval(iv);
+    document.getElementById('progressBar').style.width='100%';
+    steps.forEach(s=>{const el=document.getElementById('step_'+s.id);if(el)el.className='step done';});
+    document.getElementById('scanLabel').textContent='SCAN COMPLETE ✓';
+    if(data.error)showError(data.error);
+    else{scanReport=data;allVulns=data.vulnerabilities;showResults(data);loadStatus();}
+  }catch(e){
+    clearInterval(iv);
+    showError('خطأ في الاتصال — تأكد من تشغيل السيرفر');
+  }finally{
+    setTimeout(()=>{
+      document.getElementById('loadingBox').style.display='none';
+      document.getElementById('scanBtn').disabled=false;
+      document.getElementById('scanBtn').textContent='▶ SCAN';
+    },800);
+  }
+}
+
+function showResults(r){
+  document.getElementById('cTotal').textContent=r.summary.total;
+  document.getElementById('cHigh').textContent=r.summary.high;
+  document.getElementById('cMed').textContent=r.summary.medium;
+  document.getElementById('cLow').textContent=r.summary.low;
+  document.getElementById('cInfo').textContent=r.summary.info||0;
+  const il=document.getElementById('infoList');
+  il.innerHTML='';
+  r.info.forEach(i=>{il.innerHTML+=`<div class="info-item"><span class="info-key">${i.title}</span><span class="info-val">${i.value}</span></div>`;});
+  renderVulns(r.vulnerabilities);
+  document.getElementById('resultsBox').style.display='block';
   document.getElementById('resultsBox').scrollIntoView({behavior:'smooth'});
 }
 
-function downloadReport() {
-  if (!scanReport) return;
-  const r = scanReport;
-  let txt = `=================================================\n`;
-  txt += `  WEB SECURITY SCANNER — SCAN REPORT\n`;
-  txt += `=================================================\n\n`;
-  txt += `TARGET : ${r.url}\n`;
-  txt += `DOMAIN : ${r.domain}\n`;
-  txt += `DATE   : ${r.date}\n\n`;
-  txt += `-------------------------------------------------\n`;
-  txt += `SUMMARY\n`;
-  txt += `-------------------------------------------------\n`;
-  txt += `Total Vulnerabilities : ${r.summary.total}\n`;
-  txt += `High                  : ${r.summary.high}\n`;
-  txt += `Medium                : ${r.summary.medium}\n`;
-  txt += `Low                   : ${r.summary.low}\n\n`;
-  txt += `-------------------------------------------------\n`;
-  txt += `SYSTEM INFO\n`;
-  txt += `-------------------------------------------------\n`;
-  r.info.forEach(i => { txt += `${i.title.padEnd(20)}: ${i.value}\n`; });
-  txt += `\n-------------------------------------------------\n`;
-  txt += `VULNERABILITIES FOUND\n`;
-  txt += `-------------------------------------------------\n\n`;
-  const order = {high:0,medium:1,low:2};
-  const sorted = [...r.vulns].sort((a,b)=>order[a.severity]-order[b.severity]);
-  sorted.forEach((v,i) => {
-    txt += `[${v.severity.toUpperCase()}] #${i+1} ${v.type}\n`;
-    txt += `Description   : ${v.description}\n`;
-    txt += `Recommendation: ${v.recommendation}\n`;
-    txt += `Time          : ${v.timestamp}\n\n`;
+function renderVulns(vulns){
+  const vl=document.getElementById('vulnList');
+  vl.innerHTML='';
+  if(!vulns.length){vl.innerHTML='<div class="no-vulns">✓ No vulnerabilities found — site looks secure</div>';return;}
+  const order={high:0,medium:1,low:2,info:3};
+  const sevLabel={high:'CRITICAL',medium:'MEDIUM',low:'LOW',info:'INFO'};
+  [...vulns].sort((a,b)=>(order[a.severity]||3)-(order[b.severity]||3)).forEach((v,i)=>{
+    const sev=v.severity||'info';
+    vl.innerHTML+=`<div class="vuln-card vuln-${sev}">
+      <div class="vuln-head" onclick="this.nextElementSibling.classList.toggle('open')">
+        <span class="vuln-title"><span class="vtag">${sevLabel[sev]}</span>${v.type}</span>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--text2);">▼</span>
+      </div>
+      <div class="vuln-body">
+        <div class="vuln-row"><span class="vl">DESCRIPTION</span><span class="vv">${v.description}</span></div>
+        <div class="vuln-row"><span class="vl">IMPACT</span><span class="vv">${v.impact||'—'}</span></div>
+        <div class="vuln-row"><span class="vl">FIX</span><span class="vv">${v.recommendation}</span></div>
+        ${v.evidence?`<div class="vuln-row"><span class="vl">EVIDENCE</span><span class="vv"><div class="evidence">${v.evidence}</div></span></div>`:''}
+        <div class="vuln-row"><span class="vl">TIME</span><span class="vv" style="font-family:var(--mono);font-size:10px;">${v.timestamp}</span></div>
+      </div></div>`;
   });
-  txt += `=================================================\n`;
-  txt += `Generated by Web Security Scanner v1.0\n`;
-  txt += `FOR AUTHORIZED USE ONLY\n`;
-  txt += `=================================================\n`;
-
-  const blob = new Blob([txt], {type:'text/plain;charset=utf-8'});
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `scan_report_${r.domain}_${Date.now()}.txt`;
-  a.click();
 }
 
-function showError(msg) {
-  const el = document.getElementById('errorBox');
-  el.textContent = '✗ ' + msg;
-  el.style.display = 'block';
+function filterVulns(sev,tab){
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  tab.classList.add('active');
+  renderVulns(sev==='all'?allVulns:allVulns.filter(v=>v.severity===sev));
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function downloadTxt(){
+  if(!scanReport)return;
+  const r=scanReport;
+  let t=`================================================================\n  BUG BOUNTY SCANNER PRO v4.1\n================================================================\n\nTARGET  : ${r.target}\nDOMAIN  : ${r.domain}\nDATE    : ${r.scan_date}\nDURATION: ${r.duration}s\n\nSUMMARY\n-------\nCritical:${r.summary.high} Medium:${r.summary.medium} Low:${r.summary.low} Info:${r.summary.info||0} Total:${r.summary.total}\n\nINFO\n----\n`;
+  r.info.forEach(i=>{t+=`${i.title.padEnd(22)}: ${i.value}\n`;});
+  t+=`\nVULNERABILITIES\n---------------\n\n`;
+  const order={high:0,medium:1,low:2,info:3};
+  [...r.vulnerabilities].sort((a,b)=>(order[a.severity]||3)-(order[b.severity]||3)).forEach((v,i)=>{
+    t+=`[${(v.severity||'info').toUpperCase()}] #${i+1} — ${v.type}\n  Desc    : ${v.description}\n  Impact  : ${v.impact||'—'}\n  Fix     : ${v.recommendation}\n`;
+    if(v.evidence)t+=`  Evidence: ${v.evidence}\n`;
+    t+=`  Time    : ${v.timestamp}\n\n`;
+  });
+  t+=`================================================================\nFOR AUTHORIZED SECURITY TESTING ONLY\n================================================================\n`;
+  dl(t,'text/plain',`report_${r.domain}_${Date.now()}.txt`);
+}
 
-document.getElementById('urlInput').addEventListener('keypress', e => {
-  if (e.key === 'Enter') startScan();
-});
+function downloadJson(){
+  if(!scanReport)return;
+  dl(JSON.stringify(scanReport,null,2),'application/json',`report_${scanReport.domain}_${Date.now()}.json`);
+}
+
+function dl(content,type,name){
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([content],{type}));
+  a.download=name;a.click();
+}
+
+function showError(msg){
+  const el=document.getElementById('errorBox');
+  el.textContent='✗ '+msg;
+  el.style.display='block';
+}
+
+document.getElementById('urlInput').addEventListener('keypress',e=>{if(e.key==='Enter')startScan();});
 </script>
 </body>
-</html>
+</html>'''
+
+# =====================================================
+# Scanner Engine
+# =====================================================
+class ProScanner:
+    def __init__(self, url, modules):
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        self.url=url; self.domain=urlparse(url).netloc
+        self.modules=set(modules); self.vulns=[]; self.info=[]
+        self.session=req.Session()
+        self.session.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+        self.base_response=None
+
+    def vuln(self,vtype,severity,desc,rec,impact='',evidence=''):
+        self.vulns.append({'type':vtype,'severity':severity,'description':desc,'recommendation':rec,'impact':impact,'evidence':evidence,'timestamp':datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+
+    def info_add(self,title,value):
+        self.info.append({'title':title,'value':str(value)})
+
+    def get_base(self):
+        if not self.base_response:
+            try: self.base_response=self.session.get(self.url,timeout=10,verify=False)
+            except: pass
+        return self.base_response
+
+    def check_ssl(self):
+        if 'ssl' not in self.modules: return
+        if self.url.startswith('http://'):
+            self.vuln('Missing HTTPS','high','الموقع لا يستخدم HTTPS','استخدم SSL Certificate','MITM Attack','Protocol: http://'); return
+        try:
+            ctx=ssl.create_default_context()
+            with socket.create_connection((self.domain,443),timeout=5) as s:
+                with ctx.wrap_socket(s,server_hostname=self.domain) as ss:
+                    cert=ss.getpeercert(); exp=datetime.strptime(cert['notAfter'],'%b %d %H:%M:%S %Y %Z')
+                    days=(exp-datetime.now()).days; ver=ss.version()
+                    self.info_add('SSL Version',ver); self.info_add('SSL Expires',f'{days} days')
+                    if days<30: self.vuln('SSL Expiring','medium',f'SSL ينتهي خلال {days} يوم','جدد الشهادة','انقطاع الخدمة',f'Expires: {exp.strftime("%Y-%m-%d")}')
+                    if ver in('TLSv1','TLSv1.1'): self.vuln('Weak TLS','medium',f'{ver} قديم وغير آمن','استخدم TLS 1.3','POODLE/BEAST',f'Version: {ver}')
+        except ssl.SSLCertVerificationError as e: self.vuln('Invalid SSL','high','شهادة SSL غير صالحة','جدد من CA موثوق','MITM',str(e)[:80])
+        except Exception as e: self.info_add('SSL Error',str(e)[:80])
+
+    def check_headers(self):
+        if 'headers' not in self.modules: return
+        r=self.get_base()
+        if not r: return
+        h=r.headers
+        self.info_add('HTTP Status',r.status_code)
+        if 'Server' in h: self.info_add('Server',h['Server']); self.vuln('Server Disclosure','low',f"Server: {h['Server']}",'أخفِ Server header','Info leak',f"Server: {h['Server']}")
+        if 'X-Powered-By' in h: self.vuln('Tech Disclosure','low',f"X-Powered-By: {h['X-Powered-By']}",'أزل هذا الـ header','Info leak',f"X-Powered-By: {h['X-Powered-By']}")
+        for hdr,sev,desc,rec,impact in [
+            ('X-Frame-Options','medium','عرضة لـ Clickjacking','أضف: X-Frame-Options: DENY','Clickjacking'),
+            ('X-XSS-Protection','low','حماية XSS معطلة','أضف: X-XSS-Protection: 1; mode=block','XSS'),
+            ('X-Content-Type-Options','low','عرضة لـ MIME Sniffing','أضف: X-Content-Type-Options: nosniff','MIME Sniffing'),
+            ('Strict-Transport-Security','high','لا يوجد HSTS','أضف: Strict-Transport-Security: max-age=31536000','SSL Stripping'),
+            ('Content-Security-Policy','high','لا يوجد CSP','أضف CSP مناسب','XSS المتقدم'),
+            ('Referrer-Policy','low','لا يوجد Referrer-Policy','أضف: Referrer-Policy: strict-origin-when-cross-origin','Info Leak'),
+            ('Permissions-Policy','low','لا يوجد Permissions-Policy','أضف Permissions-Policy','Unrestricted APIs'),
+        ]:
+            if hdr not in h: self.vuln(f'Missing: {hdr}',sev,desc,rec,impact,'Header absent')
+
+    def check_sql(self):
+        if 'sql' not in self.modules: return
+        payloads=["'",'"',"' OR '1'='1","'; DROP TABLE--"]
+        errors=['sql syntax','mysql_fetch','ora-01','microsoft ole db','unclosed quotation','sqlite_exception','postgresql','you have an error in your sql','warning: mysql']
+        r=self.get_base()
+        if not r: return
+        try:
+            soup=BeautifulSoup(r.text,'html.parser')
+            for form in soup.find_all('form'):
+                action=form.get('action',''); form_url=urljoin(self.url,action)
+                inputs=form.find_all('input')
+                for pl in payloads:
+                    data={inp.get('name','test'):pl for inp in inputs if inp.get('name')}
+                    if not data: continue
+                    try:
+                        resp=self.session.post(form_url,data=data,timeout=6,verify=False)
+                        for err in errors:
+                            if err in resp.text.lower(): self.vuln('SQL Injection','high',f'SQL Injection في: {form_url}','استخدم Prepared Statements','اختراق DB',f'Payload: {pl}'); return
+                    except: pass
+            if '?' in self.url:
+                base,params=self.url.split('?',1)
+                for pl in["'","' OR '1'='1"]:
+                    try:
+                        resp=self.session.get(f"{base}?{params}{pl}",timeout=5,verify=False)
+                        for err in errors:
+                            if err in resp.text.lower(): self.vuln('SQL Injection (GET)','high','SQL Injection في URL params','تحقق من URL params','اختراق DB',f'{params}{pl}'); return
+                    except: pass
+        except: pass
+
+    def check_xss(self):
+        if 'xss' not in self.modules: return
+        payloads=['<script>alert(1)</script>','"><script>alert(1)</script>',"'><img src=x onerror=alert(1)>",'<svg onload=alert(1)>']
+        r=self.get_base()
+        if not r: return
+        try:
+            soup=BeautifulSoup(r.text,'html.parser')
+            for form in soup.find_all('form'):
+                action=form.get('action',''); form_url=urljoin(self.url,action)
+                inputs=form.find_all('input')
+                for pl in payloads:
+                    data={inp.get('name','test'):pl for inp in inputs if inp.get('name')}
+                    if not data: continue
+                    try:
+                        resp=self.session.post(form_url,data=data,timeout=5,verify=False)
+                        if pl in resp.text: self.vuln('Reflected XSS','high',f'XSS في: {form_url}','Encode المدخلات وفعّل CSP','سرقة Cookies',f'Payload: {pl[:50]}'); return
+                    except: pass
+        except: pass
+
+    def check_files(self):
+        if 'files' not in self.modules: return
+        for fpath,fdesc in[('/.env','Env secrets'),('/.git/config','Git config'),('/.git/HEAD','Git repo'),('/config.php','PHP config'),('/wp-config.php','WordPress config'),('/admin','Admin panel'),('/phpmyadmin','phpMyAdmin'),('/robots.txt','Robots'),('/.htaccess','Apache config'),('/backup.zip','Backup'),('/backup.sql','DB backup'),('/.DS_Store','Mac metadata'),('/config.yml','YAML config'),('/web.config','IIS config'),('/server-status','Apache status'),('/api/v1/users','API users'),('/composer.json','PHP deps'),('/package.json','Node deps'),('/.bash_history','Shell history'),('/debug','Debug endpoint')]:
+            try:
+                url=self.url.rstrip('/')+fpath
+                resp=self.session.get(url,timeout=4,verify=False,allow_redirects=False)
+                if resp.status_code==200 and len(resp.content)>0: self.vuln('Sensitive File','high',f'ملف مكشوف: {fpath} ({fdesc})','احذف أو احمِ الملف','تسريب credentials',f'URL: {url}')
+            except: pass
+
+    def check_cors(self):
+        if 'cors' not in self.modules: return
+        try:
+            r=self.session.get(self.url,timeout=8,verify=False,headers={'Origin':'https://evil.com'})
+            acao=r.headers.get('Access-Control-Allow-Origin',''); acac=r.headers.get('Access-Control-Allow-Credentials','')
+            if acao=='*': self.vuln('CORS Wildcard','medium','CORS مضبوط على *','حدد origins المسموح بها','سرقة بيانات','ACAO: *')
+            elif 'evil.com' in acao: self.vuln('CORS Misconfiguration','high' if acac.lower()=='true' else 'medium',f'يثق بـ origin خبيث','تحقق من Origin','CSRF + سرقة بيانات',f'ACAO: {acao}')
+        except: pass
+
+    def check_csrf(self):
+        if 'csrf' not in self.modules: return
+        r=self.get_base()
+        if not r: return
+        try:
+            soup=BeautifulSoup(r.text,'html.parser')
+            for form in soup.find_all('form',method=lambda m:m and m.lower()=='post'):
+                inputs=form.find_all('input')
+                if not any(kw in(i.get('name','')+i.get('id','')).lower() for i in inputs for kw in['csrf','token','nonce','_token']):
+                    self.vuln('Missing CSRF Token','medium',f'Form POST بدون CSRF token','أضف CSRF token','تنفيذ إجراءات غير مصرح بها',f'Form: {urljoin(self.url,form.get("action",""))}'); break
+        except: pass
+
+    def check_cookies(self):
+        if 'cookies' not in self.modules: return
+        r=self.get_base()
+        if not r: return
+        sc=r.headers.get('Set-Cookie','').lower()
+        for name in r.cookies:
+            if name.lower() in['session','sessionid','phpsessid','jsessionid','auth','token']:
+                issues=[f for f,k in[('HttpOnly','httponly'),('Secure','secure'),('SameSite','samesite')] if k not in sc]
+                if issues: self.vuln('Insecure Cookie','medium',f'Cookie "{name}" يفتقر لـ: {", ".join(issues)}','أضف HttpOnly; Secure; SameSite=Strict','سرقة Session',f'Missing: {", ".join(issues)}')
+
+    def check_redirect(self):
+        if 'redirect' not in self.modules: return
+        for param in['redirect','url','next','return','goto','dest','target']:
+            try:
+                resp=self.session.get(f"{self.url}?{param}=https://evil.com",timeout=5,verify=False,allow_redirects=False)
+                if resp.status_code in(301,302,303,307,308) and 'evil.com' in resp.headers.get('Location',''):
+                    self.vuln('Open Redirect','medium',f'Open Redirect عبر "{param}"','تحقق من URL','Phishing',f'?{param}=https://evil.com'); return
+            except: pass
+
+    def check_api(self):
+        if 'api' not in self.modules: return
+        found=[]
+        for ep in['/api','/api/v1','/api/v2','/graphql','/swagger.json','/openapi.json','/api-docs','/api/users','/api/admin','/api/v1/users','/api/config']:
+            try:
+                url=self.url.rstrip('/')+ep
+                resp=self.session.get(url,timeout=4,verify=False,allow_redirects=False)
+                if resp.status_code in(200,401,403):
+                    found.append(f'{ep}[{resp.status_code}]')
+                    if resp.status_code==200 and ('json' in resp.headers.get('Content-Type','') or resp.text.strip().startswith(('{','['))):
+                        self.vuln('Exposed API','medium',f'API مكشوف: {url}','أضف authentication','وصول غير مصرح',f'Status: 200')
+            except: pass
+        if found: self.info_add('API Endpoints',', '.join(found[:5]))
+
+    def check_info(self):
+        if 'info' not in self.modules: return
+        r=self.get_base()
+        if not r: return
+        for pattern,vtype,sev in[(r'(?:password|passwd)\s*[=:]\s*["\']?[\w@#$%]+','Password in Source','high'),(r'api[_-]?key\s*[=:]\s*["\']?[\w\-]+','API Key in Source','high'),(r'(?:mysql|postgresql|mongodb):\/\/[\w:@\./]+','DB Connection String','high'),(r'(?:stack trace|traceback|exception in thread)','Stack Trace Exposed','medium')]:
+            m=re.search(pattern,r.text,re.IGNORECASE)
+            if m: self.vuln(vtype,sev,f'{vtype} في source code','أزل المعلومات الحساسة','تسريب معلومات',f'Found: {m.group(0)[:60]}')
+
+    def check_dns(self):
+        if 'dns' not in self.modules: return
+        try: self.info_add('IP Address',socket.gethostbyname(self.domain))
+        except Exception as e: self.info_add('DNS Error',str(e)); return
+        try:
+            import dns.resolver
+            try:
+                txts=dns.resolver.resolve(self.domain,'TXT')
+                if not any('v=spf1' in str(r) for r in txts): self.vuln('Missing SPF','medium','لا يوجد SPF Record','أضف SPF في DNS','Email Spoofing',f'Domain: {self.domain}')
+            except: pass
+            try:
+                mx=dns.resolver.resolve(self.domain,'MX')
+                self.info_add('MX Records',', '.join(str(r.exchange) for r in mx)[:80])
+            except: pass
+        except ImportError: pass
+
+    def run(self):
+        start=datetime.now()
+        self.info_add('Target',self.url); self.info_add('Domain',self.domain); self.info_add('Scan Date',start.strftime('%Y-%m-%d %H:%M:%S'))
+        self.check_ssl(); self.check_headers(); self.check_sql(); self.check_xss()
+        self.check_files(); self.check_cors(); self.check_csrf(); self.check_cookies()
+        self.check_redirect(); self.check_api(); self.check_info(); self.check_dns()
+        duration=(datetime.now()-start).seconds
+        summary={'total':len(self.vulns),'high':sum(1 for v in self.vulns if v['severity']=='high'),'medium':sum(1 for v in self.vulns if v['severity']=='medium'),'low':sum(1 for v in self.vulns if v['severity']=='low'),'info':sum(1 for v in self.vulns if v['severity']=='info')}
+        return{'target':self.url,'domain':self.domain,'scan_date':start.strftime('%Y-%m-%d %H:%M:%S'),'duration':duration,'modules_run':','.join(self.modules),'vulnerabilities':self.vulns,'info':self.info,'summary':summary}
+
+# =====================================================
+# Routes
+# =====================================================
+@app.route('/')
+def index():
+    return MAIN_HTML
+
+@app.route('/status')
+def status():
+    ip=get_ip(); now=time.time()
+    scan_counts_hour[ip]=[t for t in scan_counts_hour[ip] if t>now-3600]
+    used=len(scan_counts_hour[ip])
+    return jsonify({'used':used,'remaining':max(0,CONFIG['MAX_SCANS_PER_HOUR']-used),'max_hour':CONFIG['MAX_SCANS_PER_HOUR']})
+
+@app.route('/scan',methods=['POST'])
+def scan():
+    # فحص AJAX فقط
+    if request.headers.get('X-Requested-With') != 'XMLHttpRequest':
+        return jsonify({'error':'طلب غير صالح'}), 403
+
+    ip=get_ip()
+
+    # Rate limiting
+    ok,msg=check_rate_limit(ip)
+    if not ok:
+        log_event('RATE_LIMIT',f'Rate limited: {ip}')
+        return jsonify({'error':msg}),429
+
+    data=request.get_json()
+    if not data:
+        return jsonify({'error':'بيانات غير صالحة'}),400
+
+    url=data.get('url','').strip()
+    modules=data.get('modules',['ssl','headers','sql','xss','files','cors','csrf','cookies','redirect','api','info','dns'])
+
+    # Validate
+    valid,result=validate_url(url)
+    if not valid:
+        log_event('BLOCKED',f'Invalid URL: {url} — {result}')
+        return jsonify({'error':result}),400
+
+    url=result
+    record_scan(ip)
+    log_event('SCAN',f'Scanning: {url}')
+
+    try:
+        results=ProScanner(url,modules).run()
+        log_event('DONE',f'{url} | Total:{results["summary"]["total"]} High:{results["summary"]["high"]}')
+        return jsonify(results)
+    except Exception as e:
+        log_event('ERROR',f'{url}: {str(e)}')
+        return jsonify({'error':str(e)}),500
+
+# =====================================================
+# Main
+# =====================================================
+if __name__=='__main__':
+    print('\n'+'='*56)
+    print('  🛡️  Bug Bounty Scanner Pro v4.1')
+    print('='*56)
+    print('  🌐  http://localhost:5000')
+    print('  🔒  No Login Required — Public Access')
+    print('  🛡️  Rate Limiting: 20 scans/hour, 2/minute')
+    print('  🚫  Local IPs & Blacklist: Protected')
+    print('  📝  Audit Log: scanner_audit.log')
+    print('  🔐  AJAX-Only API: Protected')
+    print('  ⚠️   Authorized Testing Only')
+    print('='*56+'\n')
+    app.run(debug=False,host='0.0.0.0',port=5000)
